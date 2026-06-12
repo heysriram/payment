@@ -1,0 +1,410 @@
+// Payment Gateway — Prisma Schema
+// PCI-safe: NO PAN, NO CVV, NO raw card data stored anywhere
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum MerchantStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+}
+
+enum MerchantRole {
+  OWNER
+  ADMIN
+  FINANCE
+  VIEWER
+}
+
+enum ApiKeyMode {
+  TEST
+  LIVE
+}
+
+enum PaymentMethodType {
+  CARD
+  UPI
+  NETBANKING
+  WALLET
+  BANK_ACCOUNT
+}
+
+enum PaymentIntentStatus {
+  REQUIRES_PM
+  REQUIRES_CONFIRMATION
+  REQUIRES_ACTION
+  PROCESSING
+  SUCCEEDED
+  CANCELLED
+  FAILED
+}
+
+enum CaptureMethod {
+  AUTOMATIC
+  MANUAL
+}
+
+enum TransactionType {
+  AUTH
+  CAPTURE
+  REFUND
+  VOID
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum DisputeStatus {
+  NEEDS_RESPONSE
+  UNDER_REVIEW
+  WON
+  LOST
+}
+
+enum PayoutStatus {
+  SCHEDULED
+  PROCESSING
+  PAID
+  FAILED
+  CANCELLED
+}
+
+enum LedgerAccount {
+  PROCESSOR
+  AVAILABLE
+  PENDING
+  FEES
+  REFUNDS
+  DISPUTES
+}
+
+enum WebhookStatus {
+  ACTIVE
+  DISABLED
+  FAILING
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+// ─────────────────────────────────────────────
+// MERCHANT CORE
+// ─────────────────────────────────────────────
+
+model FeePlan {
+  id             String @id @default(uuid())
+  name           String @unique
+  percentBps     Int // basis points, e.g. 200 = 2%
+  fixedPaise     Int // fixed per-txn charge in smallest unit
+  intlPercentBps Int // international card rate
+  currency       String @default("INR") @db.Char(3)
+
+  merchants Merchant[]
+
+  @@map("fee_plans")
+}
+
+model Merchant {
+  id               String         @id @default(uuid())
+  name             String
+  legalName        String
+  gst              String?        @unique
+  pan              String?        @unique // business PAN, NOT card PAN
+  status           MerchantStatus @default(PENDING)
+  settlementBankId String? // FK to external bank account record
+  feePlanId        String
+  createdAt        DateTime       @default(now())
+
+  feePlan        FeePlan         @relation(fields: [feePlanId], references: [id])
+  merchantUsers  MerchantUser[]
+  apiKeys        ApiKey[]
+  customers      Customer[]
+  paymentIntents PaymentIntent[]
+  payouts        Payout[]
+  ledgerEntries  LedgerEntry[]
+  webhooks       Webhook[]
+  auditLogs      AuditLog[]
+
+  @@map("merchants")
+}
+
+model MerchantUser {
+  merchantId String
+  userId     String
+  role       MerchantRole @default(VIEWER)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([merchantId, userId])
+  @@map("merchant_users")
+}
+
+model ApiKey {
+  id         String     @id @default(uuid())
+  merchantId String
+  keyId      String     @unique // public identifier (e.g. pk_live_...)
+  keyHash    String // bcrypt/argon2 hash of secret
+  scopes     Json       @default("[]") // e.g. ["payments:write","refunds:read"]
+  mode       ApiKeyMode
+  lastUsedAt DateTime?
+  createdAt  DateTime   @default(now())
+  revokedAt  DateTime?
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("api_keys")
+}
+
+// ─────────────────────────────────────────────
+// CUSTOMER & PAYMENT METHODS (PCI-safe)
+// ─────────────────────────────────────────────
+
+model Customer {
+  id         String   @id @default(uuid())
+  merchantId String
+  externalId String // merchant's own customer ID
+  email      String?
+  phone      String?
+  name       String?
+  createdAt  DateTime @default(now())
+
+  merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentMethods PaymentMethod[]
+  paymentIntents PaymentIntent[]
+
+  @@unique([merchantId, externalId])
+  @@map("customers")
+}
+
+/// Stores tokenised payment method details ONLY.
+/// NO PAN, NO CVV — these are vaulted externally (e.g. Razorpay Vault / Stripe Vault).
+model PaymentMethod {
+  id              String            @id @default(uuid())
+  customerId      String
+  type            PaymentMethodType
+  tokenId         String            @unique // vault token reference
+  brand           String? // VISA, MC, RUPAY, etc.
+  last4           String?           @db.Char(4)
+  expMonth        Int?
+  expYear         Int?
+  isInternational Boolean           @default(false)
+  fingerprint     String? // used to detect duplicate cards
+  createdAt       DateTime          @default(now())
+
+  customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  paymentIntents PaymentIntent[]
+
+  @@map("payment_methods")
+}
+
+// ─────────────────────────────────────────────
+// PAYMENT FLOW
+// ─────────────────────────────────────────────
+
+model PaymentIntent {
+  id              String              @id @default(uuid())
+  merchantId      String
+  customerId      String?
+  paymentMethodId String?
+  amount          Int // in smallest currency unit (paise)
+  currency        String              @db.Char(3)
+  status          PaymentIntentStatus @default(REQUIRES_PM)
+  clientSecret    String // SHA-256 hash of token given to frontend
+  idempotencyKey  String
+  captureMethod   CaptureMethod       @default(AUTOMATIC)
+  metadata        Json?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  merchant      Merchant       @relation(fields: [merchantId], references: [id])
+  customer      Customer?      @relation(fields: [customerId], references: [id])
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  transactions  Transaction[]
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, createdAt])
+  @@map("payment_intents")
+}
+
+model Transaction {
+  id                String            @id @default(uuid())
+  paymentIntentId   String
+  merchantId        String // denormalised for indexed queries
+  type              TransactionType
+  amount            Int
+  status            TransactionStatus @default(PENDING)
+  gateway           String // e.g. "RAZORPAY", "PAYTM", "HDFC"
+  gatewayTxnId      String?
+  processorResponse Json?
+  occurredAt        DateTime          @default(now())
+
+  paymentIntent PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  refunds       Refund[]
+  disputes      Dispute[]
+
+  @@index([merchantId, occurredAt])
+  @@map("transactions")
+}
+
+model Refund {
+  id              String       @id @default(uuid())
+  transactionId   String
+  amount          Int
+  reason          String?
+  status          RefundStatus @default(PENDING)
+  gatewayRefundId String?
+  createdAt       DateTime     @default(now())
+  settledAt       DateTime?
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+
+  @@map("refunds")
+}
+
+model Dispute {
+  id            String        @id @default(uuid())
+  transactionId String
+  reasonCode    String
+  amount        Int
+  status        DisputeStatus @default(NEEDS_RESPONSE)
+  evidence      Json?
+  dueBy         DateTime
+  createdAt     DateTime      @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+
+  @@map("disputes")
+}
+
+// ─────────────────────────────────────────────
+// SETTLEMENTS & LEDGER
+// ─────────────────────────────────────────────
+
+model Payout {
+  id           String       @id @default(uuid())
+  merchantId   String
+  amount       Int
+  currency     String       @db.Char(3)
+  status       PayoutStatus @default(SCHEDULED)
+  bankRef      String?
+  scheduledFor DateTime
+  paidAt       DateTime?
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@map("payouts")
+}
+
+/// Double-entry ledger — every financial event creates ≥2 rows (debit + credit).
+/// Invariant: SUM(delta) per (merchantId, currency) == net available balance.
+/// Positive delta = credit to that account; negative = debit.
+model LedgerEntry {
+  id         String        @id @default(uuid())
+  merchantId String
+  account    LedgerAccount
+  delta      Int // paise; positive = credit, negative = debit
+  currency   String        @db.Char(3)
+  refType    String // "TRANSACTION" | "REFUND" | "PAYOUT" | "DISPUTE" | "FEE"
+  refId      String // UUID of the source record
+  postedAt   DateTime      @default(now())
+
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId, currency, postedAt])
+  @@map("ledger")
+}
+
+// ─────────────────────────────────────────────
+// WEBHOOKS
+// ─────────────────────────────────────────────
+
+model Webhook {
+  id         String        @id @default(uuid())
+  merchantId String
+  url        String
+  secretHash String // HMAC secret (hashed at rest)
+  events     Json // e.g. ["payment.succeeded","refund.created"]
+  status     WebhookStatus @default(ACTIVE)
+  createdAt  DateTime      @default(now())
+
+  merchant   Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id            String         @id @default(uuid())
+  webhookId     String
+  eventId       String
+  status        DeliveryStatus @default(PENDING)
+  attempts      Int            @default(0)
+  lastAttemptAt DateTime?
+  responseCode  Int?
+  responseBody  String?
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, status])
+  @@map("webhook_deliveries")
+}
+
+// ─────────────────────────────────────────────
+// AUDIT
+// ─────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  merchantId String?
+  actor      String // userId or "system" or API key ID
+  action     String // e.g. "refund.created", "merchant.suspended"
+  resource   String // table name + record ID
+  before     Json?
+  after      Json?
+  ip         String?
+  occurredAt DateTime @default(now())
+
+  merchant Merchant? @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId, occurredAt])
+  @@map("audit_logs")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  totpSecret   String? // encrypted with AES-256-GCM
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  merchantUsers MerchantUser[]
+
+  @@map("users")
+}
