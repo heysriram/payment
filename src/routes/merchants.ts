@@ -270,11 +270,46 @@ merchantRouter.get(
             select: {
               currency: true,
               amount: true,
+              metadata: true,
             },
           },
         },
       });
-      res.json({ transactions });
+
+      // Fetch other ledger debit events like customer wallet withdrawals and requested payouts
+      const ledgerDebitEntries = await prisma.ledgerEntry.findMany({
+        where: {
+          merchantId: req.merchantId!,
+          refType: { in: ['WITHDRAWAL', 'PAYOUT'] },
+          account: 'AVAILABLE',
+        },
+        orderBy: { postedAt: 'desc' },
+      });
+
+      const mappedDebitTxns = ledgerDebitEntries.map((e) => ({
+        id: e.refId,
+        paymentIntentId: '',
+        merchantId: e.merchantId,
+        type: e.refType as any, // 'WITHDRAWAL' or 'PAYOUT'
+        amount: Math.abs(e.delta),
+        status: 'SUCCEEDED' as any,
+        gateway: e.refType === 'WITHDRAWAL' ? 'WALLET' : 'BANK',
+        gatewayTxnId: e.refId,
+        processorResponse: null,
+        occurredAt: e.postedAt,
+        paymentIntent: {
+          currency: e.currency,
+          amount: Math.abs(e.delta),
+          metadata: { type: e.refType.toLowerCase() },
+        },
+      }));
+
+      const allTxns = [
+        ...transactions,
+        ...mappedDebitTxns,
+      ].sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+
+      res.json({ transactions: allTxns });
     } catch (err) {
       next(err);
     }

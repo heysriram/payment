@@ -7,6 +7,8 @@ import { ConflictError, NotFoundError, ValidationError, AppError } from '../util
 import crypto from 'crypto';
 import { redis } from '../redis';
 import { config } from '../config';
+import { calculateFee } from '../services/fees';
+import { postCapture, postLedgerEntries } from '../services/ledger';
 
 export const customerRouter = Router();
 
@@ -177,6 +179,13 @@ customerRouter.post('/:id/wallet/topup/public', async (req: Request, res: Respon
       razorpay_signature: z.string(),
     }).parse(req.body);
 
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+      include: { merchant: { include: { feePlan: true } } },
+    });
+    if (!customer) throw new NotFoundError('Customer');
+    const merchantId = customer.merchantId;
+
     // Verify signature
     const hmac = crypto.createHmac('sha256', config.RAZORPAY_KEY_SECRET);
     hmac.update(razorpay_order_id + '|' + razorpay_payment_id);
@@ -199,6 +208,47 @@ customerRouter.post('/:id/wallet/topup/public', async (req: Request, res: Respon
     };
     await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
 
+    // Create Postgres records: PaymentIntent & Transaction
+    const clientSecret = crypto.randomBytes(32).toString('hex');
+    const clientSecretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+    const intent = await prisma.paymentIntent.create({
+      data: {
+        merchantId,
+        customerId,
+        amount,
+        currency: 'INR',
+        status: 'SUCCEEDED',
+        clientSecret: clientSecretHash,
+        idempotencyKey: `topup_${razorpay_payment_id}`,
+        metadata: { type: 'wallet_topup', method: 'razorpay' },
+      },
+    });
+
+    const captureTxn = await prisma.transaction.create({
+      data: {
+        paymentIntentId: intent.id,
+        merchantId,
+        type: 'CAPTURE',
+        amount,
+        status: 'SUCCEEDED',
+        gateway: 'RAZORPAY',
+        gatewayTxnId: razorpay_payment_id,
+        processorResponse: { method: 'razorpay', outcome: 'SUCCESS' },
+      },
+    });
+
+    const feeAmount = calculateFee(amount, customer.merchant.feePlan, false);
+    await prisma.$transaction(async (tx) => {
+      await postCapture(
+        tx,
+        merchantId,
+        captureTxn.id,
+        amount,
+        feeAmount,
+        'INR'
+      );
+    });
+
     res.json({ balance: nextBalance, transaction: newTxn });
   } catch (err) {
     next(err);
@@ -212,6 +262,11 @@ customerRouter.post('/:id/wallet/withdraw/public', async (req: Request, res: Res
     const { amount } = z.object({
       amount: z.number().int().positive(),
     }).parse(req.body);
+
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+    });
+    if (!customer) throw new NotFoundError('Customer');
 
     const balanceStr = await redis.get(`wallet:balance:${customerId}`);
     const available = balanceStr ? parseInt(balanceStr, 10) : 0;
@@ -232,6 +287,26 @@ customerRouter.post('/:id/wallet/withdraw/public', async (req: Request, res: Res
     };
     await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
 
+    // Post to ledger: debits merchant AVAILABLE, credits PROCESSOR
+    await prisma.$transaction(async (tx) => {
+      await postLedgerEntries(tx, customer.merchantId, [
+        {
+          account: 'AVAILABLE',
+          delta: -amount,
+          refType: 'WITHDRAWAL',
+          refId: newTxn.id,
+          currency: 'INR',
+        },
+        {
+          account: 'PROCESSOR',
+          delta: +amount,
+          refType: 'WITHDRAWAL',
+          refId: newTxn.id,
+          currency: 'INR',
+        },
+      ]);
+    });
+
     res.json({ balance: nextBalance, transaction: newTxn });
   } catch (err) {
     next(err);
@@ -247,6 +322,13 @@ customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Respons
       outcome: z.enum(['SUCCESS', 'FAILURE_DECLINED', 'FAILURE_REVERTED']).default('SUCCESS'),
       payment_method: z.string().default('card'),
     }).parse(req.body);
+
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+      include: { merchant: { include: { feePlan: true } } },
+    });
+    if (!customer) throw new NotFoundError('Customer');
+    const merchantId = customer.merchantId;
 
     let nextBalance = 0;
     const balanceStr = await redis.get(`wallet:balance:${customerId}`);
@@ -266,6 +348,48 @@ customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Respons
         ref: dummyRef,
       };
       await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+
+      // Postgres Integration
+      const clientSecret = crypto.randomBytes(32).toString('hex');
+      const clientSecretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+      const intent = await prisma.paymentIntent.create({
+        data: {
+          merchantId,
+          customerId,
+          amount,
+          currency: 'INR',
+          status: 'SUCCEEDED',
+          clientSecret: clientSecretHash,
+          idempotencyKey: `topup_${dummyRef}`,
+          metadata: { type: 'wallet_topup', method: payment_method },
+        },
+      });
+
+      const captureTxn = await prisma.transaction.create({
+        data: {
+          paymentIntentId: intent.id,
+          merchantId,
+          type: 'CAPTURE',
+          amount,
+          status: 'SUCCEEDED',
+          gateway: 'DUMMY',
+          gatewayTxnId: dummyRef,
+          processorResponse: { method: payment_method, outcome },
+        },
+      });
+
+      const feeAmount = calculateFee(amount, customer.merchant.feePlan, false);
+      await prisma.$transaction(async (tx) => {
+        await postCapture(
+          tx,
+          merchantId,
+          captureTxn.id,
+          amount,
+          feeAmount,
+          'INR'
+        );
+      });
+
       res.json({ balance: nextBalance, transaction: newTxn, outcome });
     } else if (outcome === 'FAILURE_DECLINED') {
       // 2. FAILURE_DECLINED: Log failed topup, balance unchanged
@@ -279,10 +403,40 @@ customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Respons
         ref: dummyRef,
       };
       await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+
+      // Postgres Integration
+      const clientSecret = crypto.randomBytes(32).toString('hex');
+      const clientSecretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+      const intent = await prisma.paymentIntent.create({
+        data: {
+          merchantId,
+          customerId,
+          amount,
+          currency: 'INR',
+          status: 'FAILED',
+          clientSecret: clientSecretHash,
+          idempotencyKey: `topup_${dummyRef}`,
+          metadata: { type: 'wallet_topup', method: payment_method },
+        },
+      });
+
+      await prisma.transaction.create({
+        data: {
+          paymentIntentId: intent.id,
+          merchantId,
+          type: 'CAPTURE',
+          amount,
+          status: 'FAILED',
+          gateway: 'DUMMY',
+          gatewayTxnId: dummyRef,
+          processorResponse: { method: payment_method, outcome, declineReason: 'Card Declined' },
+        },
+      });
+
       res.json({ balance: nextBalance, transaction: newTxn, outcome });
     } else if (outcome === 'FAILURE_REVERTED') {
       // 3. FAILURE_REVERTED: Money cut (increment) then reverted (decrement)
-      // Log succeeded topup
+      // Log succeeded topup in Redis
       const topupTxnId = `txn_${crypto.randomBytes(8).toString('hex')}`;
       const topupTxn = {
         id: topupTxnId,
@@ -293,7 +447,7 @@ customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Respons
         ref: dummyRef,
       };
 
-      // Log reversal transaction
+      // Log reversal transaction in Redis
       const revertTxnId = `txn_${crypto.randomBytes(8).toString('hex')}`;
       const revertTxn = {
         id: revertTxnId,
@@ -310,6 +464,85 @@ customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Respons
 
       // Balance remains unchanged net-wise
       nextBalance = currentBalance;
+
+      // Postgres Integration
+      const clientSecret = crypto.randomBytes(32).toString('hex');
+      const clientSecretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+      const intent = await prisma.paymentIntent.create({
+        data: {
+          merchantId,
+          customerId,
+          amount,
+          currency: 'INR',
+          status: 'FAILED',
+          clientSecret: clientSecretHash,
+          idempotencyKey: `topup_${dummyRef}`,
+          metadata: { type: 'wallet_topup', method: payment_method },
+        },
+      });
+
+      const captureTxn = await prisma.transaction.create({
+        data: {
+          paymentIntentId: intent.id,
+          merchantId,
+          type: 'CAPTURE',
+          amount,
+          status: 'SUCCEEDED',
+          gateway: 'DUMMY',
+          gatewayTxnId: dummyRef,
+          processorResponse: { method: payment_method, outcome, note: 'Funds captured' },
+        },
+      });
+
+      const dbRevertTxnId = `dmy_rev_${crypto.randomBytes(8).toString('hex')}`;
+      await prisma.transaction.create({
+        data: {
+          paymentIntentId: intent.id,
+          merchantId,
+          type: 'VOID',
+          amount,
+          status: 'SUCCEEDED',
+          gateway: 'DUMMY',
+          gatewayTxnId: dbRevertTxnId,
+          processorResponse: { method: payment_method, outcome, note: 'Automatically reverted/refunded due to system failure' },
+        },
+      });
+
+      const feeAmount = calculateFee(amount, customer.merchant.feePlan, false);
+      const netAmount = amount - feeAmount;
+      await prisma.$transaction(async (tx) => {
+        await postCapture(
+          tx,
+          merchantId,
+          captureTxn.id,
+          amount,
+          feeAmount,
+          'INR'
+        );
+        await postLedgerEntries(tx, merchantId, [
+          {
+            account: 'PROCESSOR',
+            delta: +amount,
+            refType: 'VOID',
+            refId: dbRevertTxnId,
+            currency: 'INR',
+          },
+          {
+            account: 'PENDING',
+            delta: -netAmount,
+            refType: 'VOID',
+            refId: dbRevertTxnId,
+            currency: 'INR',
+          },
+          {
+            account: 'FEES',
+            delta: -feeAmount,
+            refType: 'VOID',
+            refId: dbRevertTxnId,
+            currency: 'INR',
+          },
+        ]);
+      });
 
       res.json({ balance: nextBalance, transaction: topupTxn, outcome });
     }

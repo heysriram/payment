@@ -1651,6 +1651,7 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
                 <tr>
                   <th>Intent ID</th>
                   <th>Customer</th>
+                  <th>Type</th>
                   <th>Amount</th>
                   <th>Status</th>
                   <th>Date</th>
@@ -1662,6 +1663,22 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
                   <tr key={intent.id}>
                     <td style={{ fontFamily: 'monospace' }}>{intent.id.slice(0, 8)}...</td>
                     <td>{intent.customer?.name || 'Anonymous'}</td>
+                    <td>
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: '800',
+                          padding: '3px 8px',
+                          borderRadius: '8px',
+                          background: intent.metadata?.type === 'wallet_topup' ? '#f0fdfa' : '#edf4ff',
+                          color: intent.metadata?.type === 'wallet_topup' ? '#0d9488' : '#1d4ed8',
+                          border: `1px solid ${intent.metadata?.type === 'wallet_topup' ? '#99f6e4' : '#cfe0ff'}`,
+                          display: 'inline-block'
+                        }}
+                      >
+                        {intent.metadata?.type === 'wallet_topup' ? '👛 Wallet Top-up' : '📄 Invoice Checkout'}
+                      </span>
+                    </td>
                     <td>{formatCurrency(intent.amount, intent.currency)}</td>
                     <td>
                       <span className={`status-badge ${intent.status.toLowerCase()}`}>
@@ -1701,7 +1718,7 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
                 ))}
                 {intents.length === 0 && (
                   <tr>
-                    <td colSpan={6} style={{ textAlign: 'center', padding: '24px', color: '#64748b' }}>
+                    <td colSpan={7} style={{ textAlign: 'center', padding: '24px', color: '#64748b' }}>
                       No payments found.
                     </td>
                   </tr>
@@ -1827,7 +1844,35 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
               {transactions.map((txn) => (
                 <tr key={txn.id}>
                   <td style={{ fontFamily: 'monospace' }}>{txn.id.slice(0, 13)}...</td>
-                  <td style={{ fontWeight: 800 }}>{txn.type}</td>
+                  <td style={{ fontWeight: 800 }}>
+                    <span
+                      style={{
+                        fontSize: '11px',
+                        fontWeight: '800',
+                        padding: '3px 8px',
+                        borderRadius: '8px',
+                        background:
+                          txn.type === 'CAPTURE' ? '#f0fdf4' :
+                          txn.type === 'REFUND' ? '#fff7ed' :
+                          txn.type === 'VOID' ? '#f1f5f9' :
+                          txn.type === 'WITHDRAWAL' ? '#fef2f2' : '#eff6ff',
+                        color:
+                          txn.type === 'CAPTURE' ? '#16a34a' :
+                          txn.type === 'REFUND' ? '#ea580c' :
+                          txn.type === 'VOID' ? '#64748b' :
+                          txn.type === 'WITHDRAWAL' ? '#dc2626' : '#2563eb',
+                        border: `1px solid ${
+                          txn.type === 'CAPTURE' ? '#bbf7d0' :
+                          txn.type === 'REFUND' ? '#ffedd5' :
+                          txn.type === 'VOID' ? '#e2e8f0' :
+                          txn.type === 'WITHDRAWAL' ? '#fecaca' : '#bfdbfe'
+                        }`,
+                        display: 'inline-block'
+                      }}
+                    >
+                      {txn.type}
+                    </span>
+                  </td>
                   <td>{formatCurrency(txn.amount, txn.paymentIntent?.currency)}</td>
                   <td>{txn.gateway}</td>
                   <td style={{ fontFamily: 'monospace' }}>{txn.gatewayTxnId || 'N/A'}</td>
