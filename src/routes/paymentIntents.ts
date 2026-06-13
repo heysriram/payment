@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../db';
 import { requireApiKey, requireScope } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
-import { postCapture, postRefund } from '../services/ledger';
+import { postCapture, postRefund, postLedgerEntries } from '../services/ledger';
 import { calculateFee } from '../services/fees';
 import {
   NotFoundError,
@@ -209,8 +209,10 @@ paymentIntentRouter.post('/:id/confirm/public', async (req: Request, res: Respon
 // POST /v1/payment_intents/:id/confirm/dummy — simulated invoice capture offline
 paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { client_secret } = z.object({
+    const { client_secret, outcome, payment_method } = z.object({
       client_secret: z.string(),
+      outcome: z.enum(['SUCCESS', 'FAILURE_DECLINED', 'FAILURE_REVERTED']).default('SUCCESS'),
+      payment_method: z.string().default('card'),
     }).parse(req.body);
 
     const intent = await prisma.paymentIntent.findUnique({
@@ -228,25 +230,40 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
       throw new ValidationError('Invalid client secret');
     }
 
-    const paymentDetails = {
-      method: 'card',
-      card: { network: 'VISA', last4: '9999' },
-      international: false,
+    const typeUpper = payment_method.toUpperCase();
+    const typeMap: Record<string, any> = {
+      CARD: 'CARD',
+      UPI: 'UPI',
+      NETBANKING: 'NETBANKING',
+      WALLET: 'WALLET',
     };
+    const pmType = typeMap[typeUpper] || 'CARD';
+
+    // Mock payment details based on method
+    let brand = 'VISA';
+    let last4 = '9999';
+    if (pmType === 'UPI') {
+      brand = 'UPI / GPay';
+      last4 = 'test@upi';
+    } else if (pmType === 'NETBANKING') {
+      brand = 'HDFC Bank';
+      last4 = '1234';
+    } else if (pmType === 'WALLET') {
+      brand = 'Paytm Wallet';
+      last4 = '8888';
+    }
 
     const dummyPaymentId = `dmy_pm_${crypto.randomBytes(8).toString('hex')}`;
 
     let paymentMethodId = intent.paymentMethodId;
     if (intent.customerId && !paymentMethodId) {
-      const pmType = 'CARD';
-
       const newPm = await prisma.paymentMethod.create({
         data: {
           customerId: intent.customerId,
           type: pmType,
           tokenId: dummyPaymentId,
-          brand: 'VISA',
-          last4: '9999',
+          brand,
+          last4,
           expMonth: 12,
           expYear: 2030,
           isInternational: false,
@@ -267,37 +284,136 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
         where: { id: intent.id },
       });
 
-      if (checkIntent?.status === 'SUCCEEDED') return;
+      if (checkIntent?.status === 'SUCCEEDED' || checkIntent?.status === 'FAILED') return;
 
-      await tx.paymentIntent.update({
-        where: { id: intent.id },
-        data: {
-          status: 'SUCCEEDED',
-          paymentMethodId: paymentMethodId || undefined,
-        },
-      });
+      if (outcome === 'SUCCESS') {
+        // 1. Success Flow
+        await tx.paymentIntent.update({
+          where: { id: intent.id },
+          data: {
+            status: 'SUCCEEDED',
+            paymentMethodId: paymentMethodId || undefined,
+          },
+        });
 
-      const captureTxn = await tx.transaction.create({
-        data: {
-          paymentIntentId: intent.id,
-          merchantId: intent.merchantId,
-          type: 'CAPTURE',
-          amount: intent.amount,
-          status: 'SUCCEEDED',
-          gateway: 'DUMMY',
-          gatewayTxnId: dummyPaymentId,
-          processorResponse: paymentDetails,
-        },
-      });
+        const captureTxn = await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'CAPTURE',
+            amount: intent.amount,
+            status: 'SUCCEEDED',
+            gateway: 'DUMMY',
+            gatewayTxnId: dummyPaymentId,
+            processorResponse: { method: payment_method, brand, last4, outcome },
+          },
+        });
 
-      await postCapture(
-        tx,
-        intent.merchantId,
-        captureTxn.id,
-        intent.amount,
-        feeAmount,
-        intent.currency
-      );
+        await postCapture(
+          tx,
+          intent.merchantId,
+          captureTxn.id,
+          intent.amount,
+          feeAmount,
+          intent.currency
+        );
+      } else if (outcome === 'FAILURE_DECLINED') {
+        // 2. Failure Declined Flow (No money cut)
+        await tx.paymentIntent.update({
+          where: { id: intent.id },
+          data: {
+            status: 'FAILED',
+            paymentMethodId: paymentMethodId || undefined,
+          },
+        });
+
+        await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'CAPTURE',
+            amount: intent.amount,
+            status: 'FAILED',
+            gateway: 'DUMMY',
+            gatewayTxnId: dummyPaymentId,
+            processorResponse: { method: payment_method, brand, last4, outcome, declineReason: 'Card Declined' },
+          },
+        });
+      } else if (outcome === 'FAILURE_REVERTED') {
+        // 3. Failure Reverted Flow (Money cut, but reverted)
+        await tx.paymentIntent.update({
+          where: { id: intent.id },
+          data: {
+            status: 'FAILED',
+            paymentMethodId: paymentMethodId || undefined,
+          },
+        });
+
+        // Create capture transaction (Succeeded)
+        const captureTxn = await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'CAPTURE',
+            amount: intent.amount,
+            status: 'SUCCEEDED',
+            gateway: 'DUMMY',
+            gatewayTxnId: dummyPaymentId,
+            processorResponse: { method: payment_method, brand, last4, outcome, note: 'Funds captured' },
+          },
+        });
+
+        // Post capture entries
+        await postCapture(
+          tx,
+          intent.merchantId,
+          captureTxn.id,
+          intent.amount,
+          feeAmount,
+          intent.currency
+        );
+
+        // Create void transaction (Reversed/Succeeded)
+        const revertTxnId = `dmy_rev_${crypto.randomBytes(8).toString('hex')}`;
+        await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'VOID',
+            amount: intent.amount,
+            status: 'SUCCEEDED',
+            gateway: 'DUMMY',
+            gatewayTxnId: revertTxnId,
+            processorResponse: { method: payment_method, brand, last4, outcome, note: 'Automatically reverted/refunded due to system failure' },
+          },
+        });
+
+        // Revert capture entries (atomic ledger reversal)
+        const netAmount = intent.amount - feeAmount;
+        await postLedgerEntries(tx, intent.merchantId, [
+          {
+            account: 'PROCESSOR',
+            delta: +intent.amount,
+            refType: 'VOID',
+            refId: revertTxnId,
+            currency: intent.currency,
+          },
+          {
+            account: 'PENDING',
+            delta: -netAmount,
+            refType: 'VOID',
+            refId: revertTxnId,
+            currency: intent.currency,
+          },
+          {
+            account: 'FEES',
+            delta: -feeAmount,
+            refType: 'VOID',
+            refId: revertTxnId,
+            currency: intent.currency,
+          },
+        ]);
+      }
     });
 
     const updatedIntent = await prisma.paymentIntent.findUnique({
@@ -311,6 +427,7 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
         amount: updatedIntent?.amount,
         currency: updatedIntent?.currency,
       },
+      outcome,
     });
   } catch (err) {
     next(err);
