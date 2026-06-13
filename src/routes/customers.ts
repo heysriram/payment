@@ -238,27 +238,81 @@ customerRouter.post('/:id/wallet/withdraw/public', async (req: Request, res: Res
   }
 });
 
-// POST /v1/customers/:id/wallet/topup/dummy — simulated wallet top-up without gateway
+// POST /v1/customers/:id/wallet/topup/dummy — simulated wallet top-up with interactive outcomes
 customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const customerId = req.params.id;
-    const { amount } = z.object({
+    const { amount, outcome, payment_method } = z.object({
       amount: z.number().int().positive(),
+      outcome: z.enum(['SUCCESS', 'FAILURE_DECLINED', 'FAILURE_REVERTED']).default('SUCCESS'),
+      payment_method: z.string().default('card'),
     }).parse(req.body);
 
-    const nextBalance = await redis.incrby(`wallet:balance:${customerId}`, amount);
+    let nextBalance = 0;
+    const balanceStr = await redis.get(`wallet:balance:${customerId}`);
+    const currentBalance = balanceStr ? parseInt(balanceStr, 10) : 0;
 
-    const newTxn = {
-      id: `txn_${crypto.randomBytes(8).toString('hex')}`,
-      type: 'TOPUP',
-      amount,
-      status: 'SUCCEEDED',
-      date: new Date(),
-      ref: `dmy_topup_${crypto.randomBytes(6).toString('hex')}`,
-    };
-    await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+    const dummyRef = `dmy_${payment_method}_${crypto.randomBytes(6).toString('hex')}`;
 
-    res.json({ balance: nextBalance, transaction: newTxn });
+    if (outcome === 'SUCCESS') {
+      // 1. SUCCESS: Increment balance and log succeeded topup
+      nextBalance = await redis.incrby(`wallet:balance:${customerId}`, amount);
+      const newTxn = {
+        id: `txn_${crypto.randomBytes(8).toString('hex')}`,
+        type: 'TOPUP',
+        amount,
+        status: 'SUCCEEDED',
+        date: new Date(),
+        ref: dummyRef,
+      };
+      await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+      res.json({ balance: nextBalance, transaction: newTxn, outcome });
+    } else if (outcome === 'FAILURE_DECLINED') {
+      // 2. FAILURE_DECLINED: Log failed topup, balance unchanged
+      nextBalance = currentBalance;
+      const newTxn = {
+        id: `txn_${crypto.randomBytes(8).toString('hex')}`,
+        type: 'TOPUP',
+        amount,
+        status: 'FAILED',
+        date: new Date(),
+        ref: dummyRef,
+      };
+      await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+      res.json({ balance: nextBalance, transaction: newTxn, outcome });
+    } else if (outcome === 'FAILURE_REVERTED') {
+      // 3. FAILURE_REVERTED: Money cut (increment) then reverted (decrement)
+      // Log succeeded topup
+      const topupTxnId = `txn_${crypto.randomBytes(8).toString('hex')}`;
+      const topupTxn = {
+        id: topupTxnId,
+        type: 'TOPUP',
+        amount,
+        status: 'SUCCEEDED',
+        date: new Date(),
+        ref: dummyRef,
+      };
+
+      // Log reversal transaction
+      const revertTxnId = `txn_${crypto.randomBytes(8).toString('hex')}`;
+      const revertTxn = {
+        id: revertTxnId,
+        type: 'REVERSAL',
+        amount,
+        status: 'SUCCEEDED',
+        date: new Date(),
+        ref: `rev_${topupTxnId.slice(-6)}`,
+      };
+
+      // Push both to Redis transaction log
+      await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(topupTxn));
+      await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(revertTxn));
+
+      // Balance remains unchanged net-wise
+      nextBalance = currentBalance;
+
+      res.json({ balance: nextBalance, transaction: topupTxn, outcome });
+    }
   } catch (err) {
     next(err);
   }

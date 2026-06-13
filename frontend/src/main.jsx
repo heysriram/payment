@@ -535,6 +535,16 @@ function CustomerDashboard({ state, api, handleLogout }) {
   const [withdrawAmount, setWithdrawAmount] = useState('');
   const [walletLoading, setWalletLoading] = useState(false);
 
+  // Dummy Gateway States for Wallet Topup
+  const [showDummyGateway, setShowDummyGateway] = useState(false);
+  const [dummyGatewayMethod, setDummyGatewayMethod] = useState('card');
+  const [dummyGatewayOutcome, setDummyGatewayOutcome] = useState('SUCCESS');
+  const [dummyCardNumber, setDummyCardNumber] = useState('4111 1111 1111 1111');
+  const [dummyUpiVpa, setDummyUpiVpa] = useState('test@upi');
+  const [dummyBank, setDummyBank] = useState('HDFC Bank');
+  const [dummyWallet, setDummyWallet] = useState('Paytm Wallet');
+  const [topupFailureMessage, setTopupFailureMessage] = useState('');
+
   const fetchData = async () => {
     setLoading(true);
     try {
@@ -638,27 +648,56 @@ function CustomerDashboard({ state, api, handleLogout }) {
     }
   };
 
-  const handleDummyAddFunds = async (e) => {
+  const handleDummyAddFunds = (e) => {
     if (e) e.preventDefault();
     const amountInPaise = Math.round(Number(addAmount) * 100);
     if (amountInPaise < 100) {
       alert('Minimum top-up amount is ₹1.00 (100 paise).');
       return;
     }
+    setShowDummyGateway(true);
+  };
+
+  const executeDummyWalletTopUp = async (selectedMethod, selectedOutcome) => {
+    const amountInPaise = Math.round(Number(addAmount) * 100);
+    if (amountInPaise < 100) {
+      alert('Minimum top-up amount is ₹1.00 (100 paise).');
+      return;
+    }
     setWalletLoading(true);
+    setTopupFailureMessage('');
     try {
-      const data = await api({
+      await api({
         state,
         path: `/customers/${state.currentCustomerId}/wallet/topup/dummy`,
         method: 'POST',
-        body: { amount: amountInPaise },
+        body: {
+          amount: amountInPaise,
+          outcome: selectedOutcome,
+          payment_method: selectedMethod,
+        },
       });
-      alert(`Successfully added ${formatCurrency(amountInPaise)} (Dummy) to your wallet!`);
+
+      setShowDummyGateway(false);
       setShowAddFundsModal(false);
-      setAddAmount('500');
-      fetchData();
+
+      if (selectedOutcome === 'SUCCESS') {
+        alert(`Successfully added ${formatCurrency(amountInPaise)} (Dummy) to your wallet!`);
+        setAddAmount('500');
+        fetchData();
+      } else if (selectedOutcome === 'FAILURE_DECLINED') {
+        setTopupFailureMessage(
+          `Wallet Top-up Failed: Decline code 'insufficient_funds' or card declined by bank. Your account was NOT charged.`
+        );
+        fetchData();
+      } else if (selectedOutcome === 'FAILURE_REVERTED') {
+        setTopupFailureMessage(
+          `Wallet Top-up Failed: A system processing timeout occurred. A charge of ${formatCurrency(amountInPaise)} was debited from your account but has been automatically reversed/refunded.`
+        );
+        fetchData();
+      }
     } catch (err) {
-      alert(`Dummy Top-up failed: ${err.message}`);
+      alert(`Dummy Wallet Top-up failed: ${err.message}`);
     } finally {
       setWalletLoading(false);
     }
@@ -753,6 +792,38 @@ Secure payment verified via PCI Gateway.
           Logout
         </button>
       </header>
+
+      {topupFailureMessage && (
+        <div style={{
+          background: '#fef2f2',
+          border: '1px solid #fca5a5',
+          color: '#b91c1c',
+          borderRadius: '16px',
+          padding: '16px',
+          marginBottom: '20px',
+          fontSize: '13px',
+          textAlign: 'left',
+          lineHeight: '1.5'
+        }}>
+          <strong>⚠️ Wallet Top-up Transaction Failure</strong>
+          <p style={{ margin: '6px 0 0 0', color: '#991b1b' }}>{topupFailureMessage}</p>
+          <button
+            className="ghost"
+            style={{
+              marginTop: '10px',
+              padding: '4px 10px',
+              fontSize: '11px',
+              color: '#b91c1c',
+              borderColor: '#fca5a5',
+              background: '#fef2f2',
+              borderRadius: '8px'
+            }}
+            onClick={() => setTopupFailureMessage('')}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Metrics Row */}
       <section className="dashboard-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginBottom: '28px' }}>
@@ -1013,6 +1084,197 @@ Secure payment verified via PCI Gateway.
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {showDummyGateway && (
+        <div className="modal-overlay" style={{ zIndex: 9999 }} onClick={() => setShowDummyGateway(false)}>
+          <div className="modal-card" style={{ maxWidth: '520px', padding: '28px', borderRadius: '24px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #cbd5e1', paddingBottom: '12px', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '24px' }}>🛡️</span>
+                <div style={{ textAlign: 'left' }}>
+                  <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>Secure Sandbox Gateway</h3>
+                  <span style={{ fontSize: '11px', color: '#64748b' }}>Simulated Payment Processor</span>
+                </div>
+              </div>
+              <button className="ghost" type="button" style={{ padding: '6px 12px', borderRadius: '10px' }} onClick={() => setShowDummyGateway(false)}>Close</button>
+            </div>
+
+            {/* Merchant / Amount Info Header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', background: '#f8fafc', padding: '14px', borderRadius: '16px', border: '1px solid #cbd5e1', marginBottom: '20px', fontSize: '13px' }}>
+              <div style={{ textAlign: 'left' }}>
+                <span style={{ color: '#64748b', display: 'block', fontSize: '10px', fontWeight: 'bold', textTransform: 'uppercase' }}>Paying Merchant</span>
+                <strong style={{ display: 'block', marginTop: '3px' }}>Self (Wallet Top-up)</strong>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <span style={{ color: '#64748b', display: 'block', fontSize: '10px', fontWeight: 'bold', textTransform: 'uppercase' }}>Amount Due</span>
+                <strong style={{ color: '#2563eb', display: 'block', marginTop: '3px', fontSize: '16px' }}>{formatCurrency(Math.round(Number(addAmount) * 100))}</strong>
+              </div>
+            </div>
+
+            {/* Step 1: Select Payment Method */}
+            <div style={{ textAlign: 'left', marginBottom: '20px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 800, color: '#475569', display: 'block', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Choose Payment Method</span>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px' }}>
+                {[
+                  { id: 'card', label: 'Card', icon: '💳' },
+                  { id: 'upi', label: 'UPI', icon: '📱' },
+                  { id: 'netbanking', label: 'Bank', icon: '🏦' },
+                  { id: 'wallet', label: 'Wallet', icon: '👛' },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setDummyGatewayMethod(m.id)}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: '6px',
+                      padding: '12px 8px',
+                      borderRadius: '16px',
+                      border: '2px solid',
+                      borderColor: dummyGatewayMethod === m.id ? '#2563eb' : '#cbd5e1',
+                      background: dummyGatewayMethod === m.id ? '#edf4ff' : 'white',
+                      color: dummyGatewayMethod === m.id ? '#1e40af' : '#1e293b',
+                      fontSize: '11px',
+                      fontWeight: '800',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <span style={{ fontSize: '18px' }}>{m.icon}</span>
+                    <span>{m.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Step 2: Payment Details Entry Mockup */}
+            <div style={{ textAlign: 'left', background: '#f8fafc', padding: '16px', borderRadius: '16px', border: '1px solid #cbd5e1', marginBottom: '20px' }}>
+              {dummyGatewayMethod === 'card' && (
+                <div style={{ display: 'grid', gap: '10px' }}>
+                  <Input label="Mock Card Number" value={dummyCardNumber} onChange={setDummyCardNumber} placeholder="4111 1111 1111 1111" />
+                  <div className="row" style={{ display: 'flex', gap: '8px' }}>
+                    <div style={{ flex: 1 }}><Input label="Expiry Date" placeholder="MM/YY" value="12/30" onChange={() => {}} /></div>
+                    <div style={{ flex: 1 }}><Input label="CVV" type="password" placeholder="123" value="123" onChange={() => {}} /></div>
+                  </div>
+                </div>
+              )}
+              {dummyGatewayMethod === 'upi' && (
+                <div>
+                  <Input label="Mock UPI VPA Address" value={dummyUpiVpa} onChange={setDummyUpiVpa} placeholder="e.g. user@gpay" />
+                  <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+                    {['test@upi', 'customer@okaxis', 'pay@ybl'].map((vpa) => (
+                      <button
+                        key={vpa}
+                        type="button"
+                        className="ghost"
+                        style={{ padding: '4px 8px', borderRadius: '8px', fontSize: '10px' }}
+                        onClick={() => setDummyUpiVpa(vpa)}
+                      >
+                        {vpa}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {dummyGatewayMethod === 'netbanking' && (
+                <div>
+                  <Select
+                    label="Mock Bank Institution"
+                    value={dummyBank}
+                    onChange={setDummyBank}
+                    options={['HDFC Bank', 'State Bank of India', 'ICICI Bank', 'Axis Bank', 'Kotak Bank']}
+                  />
+                </div>
+              )}
+              {dummyGatewayMethod === 'wallet' && (
+                <div>
+                  <Select
+                    label="Mock Wallet Service"
+                    value={dummyWallet}
+                    onChange={setDummyWallet}
+                    options={['Paytm Wallet', 'PhonePe Wallet', 'Amazon Pay', 'Mobikwik']}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Step 3: Choose Transaction Outcome */}
+            <div style={{ textAlign: 'left', marginBottom: '24px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 800, color: '#475569', display: 'block', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Simulate Gateway Outcome</span>
+              <div style={{ display: 'grid', gap: '10px' }}>
+                {[
+                  {
+                    id: 'SUCCESS',
+                    title: '🟢 SUCCESS',
+                    desc: 'Debits customer, credits wallet balance, registers SUCCESS status.',
+                  },
+                  {
+                    id: 'FAILURE_DECLINED',
+                    title: '🔴 FAILURE (Card Declined)',
+                    desc: 'Simulates direct rejection. No funds are cut, registers FAILED status.',
+                  },
+                  {
+                    id: 'FAILURE_REVERTED',
+                    title: '⚠️ FAILURE (Money Cut & Reverted)',
+                    desc: 'Funds are debited, but transaction timeout triggers auto-reversal/refund.',
+                  },
+                ].map((out) => (
+                  <label
+                    key={out.id}
+                    style={{
+                      display: 'flex',
+                      gap: '12px',
+                      alignItems: 'start',
+                      padding: '12px',
+                      borderRadius: '16px',
+                      border: '2px solid',
+                      borderColor: dummyGatewayOutcome === out.id ? '#2563eb' : '#cbd5e1',
+                      background: dummyGatewayOutcome === out.id ? '#edf4ff' : 'white',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name="gateway_outcome_topup"
+                      value={out.id}
+                      checked={dummyGatewayOutcome === out.id}
+                      onChange={() => setDummyGatewayOutcome(out.id)}
+                      style={{ marginTop: '3px' }}
+                    />
+                    <div style={{ fontSize: '12px' }}>
+                      <strong style={{ display: 'block', color: dummyGatewayOutcome === out.id ? '#1e40af' : '#1e293b', fontWeight: 'bold' }}>{out.title}</strong>
+                      <span style={{ color: '#64748b', fontSize: '11px', display: 'block', marginTop: '2px', lineHeight: '1.3' }}>{out.desc}</span>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Proceed Actions */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                className="action"
+                style={{ flex: 1, height: '48px', fontSize: '14px', background: 'linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)' }}
+                onClick={() => executeDummyWalletTopUp(dummyGatewayMethod, dummyGatewayOutcome)}
+                disabled={walletLoading}
+              >
+                {walletLoading ? 'Processing Simulated Top-up...' : 'Confirm Simulated Top-up'}
+              </button>
+              <button
+                className="action secondary"
+                style={{ height: '48px' }}
+                onClick={() => setShowDummyGateway(false)}
+                disabled={walletLoading}
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
