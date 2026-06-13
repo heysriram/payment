@@ -1084,10 +1084,6 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
 
   const handleCreatePaymentLink = async (e) => {
     e.preventDefault();
-    if (!state.secretKey) {
-      alert('Secret API key is missing. Ensure you generate keys in the Dev Sandbox first.');
-      return;
-    }
     if (items.some(it => !it.name || Number(it.price) <= 0 || Number(it.quantity) <= 0)) {
       alert('Please fill out all item names, prices, and quantities correctly.');
       return;
@@ -1097,10 +1093,9 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
       const intentAmount = Math.round(totalRupees * 100); // rupees to paise
       const data = await api({
         state,
-        path: '/payment_intents',
+        path: '/merchants/payment-intents',
         method: 'POST',
-        token: state.secretKey,
-        idempotencyKey: `idem_link_${Date.now()}`,
+        token: state.dashboardJwt,
         body: {
           amount: intentAmount,
           currency: 'INR',
@@ -1493,26 +1488,6 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
                   </div>
                 </div>
               ))}
-            </div>
-          </div>
-
-          <div className="panel response-panel" style={{ position: 'static', padding: '20px', width: '100%' }}>
-            <h3>API Credentials</h3>
-            <p style={{ color: '#64748b', fontSize: '12px', marginBottom: '14px', lineHeight: '1.4' }}>
-              Assign keys here to authorize Payment Link creation and checkout tokenization.
-            </p>
-            <div style={{ display: 'grid', gap: '8px', fontSize: '13px' }}>
-              <div style={{ background: '#f8fafc', padding: '10px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                <span style={{ color: '#64748b', display: 'block', fontSize: '10px', fontWeight: 'bold' }}>ACTIVE SECRET KEY</span>
-                <strong style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{state.secretKey ? `${state.secretKey.slice(0, 10)}...${state.secretKey.slice(-6)}` : 'Not set'}</strong>
-              </div>
-              <div style={{ background: '#f8fafc', padding: '10px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                <span style={{ color: '#64748b', display: 'block', fontSize: '10px', fontWeight: 'bold' }}>ACTIVE PUBLIC KEY</span>
-                <strong style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{state.publicKey ? `${state.publicKey.slice(0, 10)}...${state.publicKey.slice(-6)}` : 'Not set'}</strong>
-              </div>
-              <button className="action secondary" type="button" onClick={() => setShowKeyModal(true)} style={{ marginTop: '10px', width: '100%', border: '1px solid #cbd5e1' }}>
-                🔑 Manage API Keys
-              </button>
             </div>
           </div>
         </div>

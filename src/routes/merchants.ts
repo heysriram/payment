@@ -208,6 +208,53 @@ merchantRouter.get(
   }
 );
 
+// POST /v1/merchants/payment-intents — first-party dashboard route to create a payment intent
+merchantRouter.post(
+  '/payment-intents',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { amount, currency, customerId, captureMethod, metadata } = z.object({
+        amount: z.number().int().min(100),
+        currency: z.string().length(3).default('INR'),
+        customerId: z.string().uuid().optional(),
+        captureMethod: z.enum(['AUTOMATIC', 'MANUAL']).default('AUTOMATIC'),
+        metadata: z.record(z.any()).optional(),
+      }).parse(req.body);
+
+      // Validate customer belongs to merchant
+      if (customerId) {
+        const customer = await prisma.customer.findFirst({
+          where: { id: customerId, merchantId: req.merchantId! },
+        });
+        if (!customer) throw new NotFoundError('Customer');
+      }
+
+      const clientSecret = crypto.randomBytes(32).toString('base64url');
+      const clientSecretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+
+      const intent = await prisma.paymentIntent.create({
+        data: {
+          merchantId: req.merchantId!,
+          customerId,
+          amount,
+          currency: currency.toUpperCase(),
+          status: 'REQUIRES_PM',
+          clientSecret: clientSecretHash,
+          idempotencyKey: `dash_${crypto.randomBytes(12).toString('hex')}`,
+          captureMethod,
+          metadata,
+        },
+      });
+
+      res.status(201).json({ paymentIntent: { ...intent, clientSecret } });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // GET /v1/merchants/transactions
 merchantRouter.get(
   '/transactions',
