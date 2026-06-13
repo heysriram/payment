@@ -206,6 +206,118 @@ paymentIntentRouter.post('/:id/confirm/public', async (req: Request, res: Respon
   }
 });
 
+// POST /v1/payment_intents/:id/confirm/dummy — simulated invoice capture offline
+paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { client_secret } = z.object({
+      client_secret: z.string(),
+    }).parse(req.body);
+
+    const intent = await prisma.paymentIntent.findUnique({
+      where: { id: req.params.id },
+      include: {
+        merchant: { include: { feePlan: true } },
+      },
+    });
+
+    if (!intent) throw new NotFoundError('Payment intent');
+
+    // Verify client secret
+    const clientSecretHash = crypto.createHash('sha256').update(client_secret).digest('hex');
+    if (intent.clientSecret !== clientSecretHash) {
+      throw new ValidationError('Invalid client secret');
+    }
+
+    const paymentDetails = {
+      method: 'card',
+      card: { network: 'VISA', last4: '9999' },
+      international: false,
+    };
+
+    const dummyPaymentId = `dmy_pm_${crypto.randomBytes(8).toString('hex')}`;
+
+    let paymentMethodId = intent.paymentMethodId;
+    if (intent.customerId && !paymentMethodId) {
+      const pmType = 'CARD';
+
+      const newPm = await prisma.paymentMethod.create({
+        data: {
+          customerId: intent.customerId,
+          type: pmType,
+          tokenId: dummyPaymentId,
+          brand: 'VISA',
+          last4: '9999',
+          expMonth: 12,
+          expYear: 2030,
+          isInternational: false,
+          fingerprint: `fp_${crypto.randomBytes(6).toString('hex')}`,
+        },
+      });
+      paymentMethodId = newPm.id;
+    }
+
+    const feeAmount = calculateFee(
+      intent.amount,
+      intent.merchant.feePlan,
+      false
+    );
+
+    await prisma.$transaction(async (tx) => {
+      const checkIntent = await tx.paymentIntent.findUnique({
+        where: { id: intent.id },
+      });
+
+      if (checkIntent?.status === 'SUCCEEDED') return;
+
+      await tx.paymentIntent.update({
+        where: { id: intent.id },
+        data: {
+          status: 'SUCCEEDED',
+          paymentMethodId: paymentMethodId || undefined,
+        },
+      });
+
+      const captureTxn = await tx.transaction.create({
+        data: {
+          paymentIntentId: intent.id,
+          merchantId: intent.merchantId,
+          type: 'CAPTURE',
+          amount: intent.amount,
+          status: 'SUCCEEDED',
+          gateway: 'DUMMY',
+          gatewayTxnId: dummyPaymentId,
+          processorResponse: paymentDetails,
+        },
+      });
+
+      await postCapture(
+        tx,
+        intent.merchantId,
+        captureTxn.id,
+        intent.amount,
+        feeAmount,
+        intent.currency
+      );
+    });
+
+    const updatedIntent = await prisma.paymentIntent.findUnique({
+      where: { id: intent.id },
+    });
+
+    res.json({
+      paymentIntent: {
+        id: updatedIntent?.id,
+        status: updatedIntent?.status,
+        amount: updatedIntent?.amount,
+        currency: updatedIntent?.currency,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
 paymentIntentRouter.use(requireApiKey, rateLimit());
 
 const createIntentSchema = z.object({

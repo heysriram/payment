@@ -238,6 +238,33 @@ customerRouter.post('/:id/wallet/withdraw/public', async (req: Request, res: Res
   }
 });
 
+// POST /v1/customers/:id/wallet/topup/dummy — simulated wallet top-up without gateway
+customerRouter.post('/:id/wallet/topup/dummy', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const customerId = req.params.id;
+    const { amount } = z.object({
+      amount: z.number().int().positive(),
+    }).parse(req.body);
+
+    const nextBalance = await redis.incrby(`wallet:balance:${customerId}`, amount);
+
+    const newTxn = {
+      id: `txn_${crypto.randomBytes(8).toString('hex')}`,
+      type: 'TOPUP',
+      amount,
+      status: 'SUCCEEDED',
+      date: new Date(),
+      ref: `dmy_topup_${crypto.randomBytes(6).toString('hex')}`,
+    };
+    await redis.lpush(`wallet:transactions:${customerId}`, JSON.stringify(newTxn));
+
+    res.json({ balance: nextBalance, transaction: newTxn });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
 // Authenticated routes require API key
 customerRouter.use(requireApiKey, rateLimit());
 

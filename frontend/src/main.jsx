@@ -638,6 +638,32 @@ function CustomerDashboard({ state, api, handleLogout }) {
     }
   };
 
+  const handleDummyAddFunds = async (e) => {
+    if (e) e.preventDefault();
+    const amountInPaise = Math.round(Number(addAmount) * 100);
+    if (amountInPaise < 100) {
+      alert('Minimum top-up amount is ₹1.00 (100 paise).');
+      return;
+    }
+    setWalletLoading(true);
+    try {
+      const data = await api({
+        state,
+        path: `/customers/${state.currentCustomerId}/wallet/topup/dummy`,
+        method: 'POST',
+        body: { amount: amountInPaise },
+      });
+      alert(`Successfully added ${formatCurrency(amountInPaise)} (Dummy) to your wallet!`);
+      setShowAddFundsModal(false);
+      setAddAmount('500');
+      fetchData();
+    } catch (err) {
+      alert(`Dummy Top-up failed: ${err.message}`);
+    } finally {
+      setWalletLoading(false);
+    }
+  };
+
   const handleWithdrawSubmit = async (e) => {
     e.preventDefault();
     const amountInPaise = Math.round(Number(withdrawAmount) * 100);
@@ -940,9 +966,18 @@ Secure payment verified via PCI Gateway.
                 onChange={setAddAmount}
                 placeholder="e.g. 500"
               />
-              <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '20px' }}>
                 <button className="action" type="submit" disabled={walletLoading}>
-                  {walletLoading ? 'Processing...' : 'Proceed to Checkout'}
+                  {walletLoading ? 'Processing...' : 'Pay via Razorpay'}
+                </button>
+                <button
+                  className="action"
+                  type="button"
+                  style={{ background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)' }}
+                  onClick={handleDummyAddFunds}
+                  disabled={walletLoading}
+                >
+                  {walletLoading ? 'Processing...' : 'Simulate Dummy Payment'}
                 </button>
                 <button className="action secondary" type="button" onClick={() => setShowAddFundsModal(false)} disabled={walletLoading}>
                   Cancel
@@ -2012,6 +2047,34 @@ function CustomerCheckout({ intentId, clientSecret, state, setView }) {
     }
   };
 
+  const handleDummyPay = async () => {
+    if (!intent) return;
+    setPaying(true);
+    try {
+      const confirmData = await api({
+        state,
+        path: `/payment_intents/${intent.id}/confirm/dummy`,
+        method: 'POST',
+        body: {
+          client_secret: clientSecret,
+        },
+      });
+
+      setSuccessDetails({
+        paymentId: confirmData.paymentIntent.id || `dmy_pm_${Math.random().toString(36).substring(2, 10)}`,
+        orderId: `dmy_ord_${Math.random().toString(36).substring(2, 10)}`,
+        status: confirmData.paymentIntent.status,
+        amount: confirmData.paymentIntent.amount,
+        currency: confirmData.paymentIntent.currency,
+      });
+    } catch (err) {
+      alert(`Dummy Payment confirmation failed: ${err.message}`);
+    } finally {
+      setPaying(false);
+    }
+  };
+
+
   if (loading) {
     return (
       <div className="checkout-wrapper">
@@ -2059,7 +2122,7 @@ function CustomerCheckout({ intentId, clientSecret, state, setView }) {
               </strong>
             </div>
             <div className="receipt-row">
-              <span>Razorpay Payment ID</span>
+              <span>{successDetails.paymentId.startsWith('dmy_') ? 'Payment Reference ID' : 'Razorpay Payment ID'}</span>
               <strong>{successDetails.paymentId}</strong>
             </div>
             <div className="receipt-row">
@@ -2145,12 +2208,22 @@ function CustomerCheckout({ intentId, clientSecret, state, setView }) {
         </div>
 
         <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '24px', lineHeight: '1.5' }}>
-          Select card, UPI, net banking, or wallet in the Razorpay overlay checkout to complete your transaction.
+          Select card, UPI, net banking, or wallet in the Razorpay overlay checkout, or simulate a dummy offline payment to complete your transaction.
         </p>
 
-        <button className="checkout-btn" onClick={handlePay} disabled={paying}>
-          {paying ? 'Launching Gateway...' : 'Pay with Razorpay'}
-        </button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          <button className="checkout-btn" onClick={handlePay} disabled={paying}>
+            {paying ? 'Launching Gateway...' : 'Pay with Razorpay'}
+          </button>
+          <button
+            className="checkout-btn"
+            style={{ background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)', marginTop: 0 }}
+            onClick={handleDummyPay}
+            disabled={paying}
+          >
+            {paying ? 'Processing...' : 'Simulate Dummy Payment (Offline)'}
+          </button>
+        </div>
 
         <div className="checkout-brands">
           <span>🔒 Secured via PCI-safe Razorpay Checkout</span>
