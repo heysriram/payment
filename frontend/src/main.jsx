@@ -1375,90 +1375,78 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
       </div>
 
       <div className="content">
-        {/* Create Link Panel */}
+        {/* Payments Log Panel */}
         <section className="panel main-panel">
-          <h2>Create Invoice Payment Link</h2>
-          <p style={{ color: '#64748b', fontSize: '13px', marginBottom: '18px' }}>
-            Generate a secure customer checkout invoice link with itemized line bills.
-          </p>
-
-          {createdLink && (
-            <div className="share-box">
-              <span>Checkout Link Generated Successfully!</span>
-              <div className="share-row">
-                <input readOnly className="share-input" value={createdLink} />
-                <button
-                  className="copy-btn"
-                  onClick={() => {
-                    navigator.clipboard.writeText(createdLink);
-                    alert('Checkout link copied!');
-                  }}
-                >
-                  Copy Link
-                </button>
-                <a
-                  href={createdLink}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="copy-btn"
-                  style={{ textDecoration: 'none', background: '#2563eb' }}
-                >
-                  Pay Now
-                </a>
-              </div>
-            </div>
-          )}
-
-          <form onSubmit={handleCreatePaymentLink}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '18px' }}>
-              <span style={{ fontSize: '13px', fontWeight: 800, color: '#475569' }}>Invoice Line Items</span>
-              {items.map((item, idx) => (
-                <div key={idx} className="item-row" style={{ display: 'flex', gap: '10px', alignItems: 'flex-end' }}>
-                  <div style={{ flex: 2 }}>
-                    <Input label="Item Name" value={item.name} onChange={(v) => updateItemField(idx, 'name', v)} placeholder="e.g. Leather Shoes" />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <Input label="Price (₹)" type="number" value={item.price} onChange={(v) => updateItemField(idx, 'price', v)} />
-                  </div>
-                  <div style={{ flex: 0.6 }}>
-                    <Input label="Qty" type="number" value={item.quantity} onChange={(v) => updateItemField(idx, 'quantity', v)} />
-                  </div>
-                  {items.length > 1 && (
-                    <button type="button" className="ghost" style={{ background: '#fff1f2', borderColor: '#ffe4e6', color: '#be123c', height: '46px', padding: '0 12px', borderRadius: '14px', marginBottom: '14px' }} onClick={() => handleRemoveItem(idx)}>
-                      Remove
-                    </button>
-                  )}
-                </div>
-              ))}
-              <button type="button" className="ghost" style={{ width: 'fit-content', borderRadius: '12px', padding: '8px 16px' }} onClick={handleAddItem}>
-                + Add Item
-              </button>
-            </div>
-
-            <div className="row">
-              <Input
-                label="Customer UUID (Optional)"
-                value={customerId}
-                onChange={setCustomerId}
-                placeholder="UUID format"
-              />
-              <Select
-                label="Capture Mode"
-                value={captureMethod}
-                onChange={setCaptureMethod}
-                options={['AUTOMATIC', 'MANUAL']}
-              />
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f8fafc', padding: '16px', borderRadius: '16px', border: '1px solid #cbd5e1', margin: '18px 0' }}>
-              <span style={{ fontSize: '13px', color: '#64748b', fontWeight: 'bold' }}>Grand Total Due:</span>
-              <strong style={{ fontSize: '20px', color: '#0f172a' }}>{formatCurrency(totalRupees * 100)}</strong>
-            </div>
-
-            <button className="action" type="submit" style={{ marginTop: '10px' }}>
-              Generate Payment Link
+          <div className="table-header" style={{ marginBottom: '16px' }}>
+            <h3 style={{ margin: 0 }}>Payments Log</h3>
+            <button className="ghost" onClick={fetchData}>
+              Refresh
             </button>
-          </form>
+          </div>
+          <div className="table-container" style={{ margin: 0 }}>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Intent ID</th>
+                  <th>Customer</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Date</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {intents.map((intent) => (
+                  <tr key={intent.id}>
+                    <td style={{ fontFamily: 'monospace' }}>{intent.id.slice(0, 8)}...</td>
+                    <td>{intent.customer?.name || 'Anonymous'}</td>
+                    <td>{formatCurrency(intent.amount, intent.currency)}</td>
+                    <td>
+                      <span className={`status-badge ${intent.status.toLowerCase()}`}>
+                        {intent.status}
+                      </span>
+                    </td>
+                    <td>{new Date(intent.createdAt).toLocaleDateString()}</td>
+                    <td>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button className="ghost" style={{ padding: '4px 10px', fontSize: '11px' }} onClick={() => setSelectedIntent(intent)}>
+                          View
+                        </button>
+                        {intent.status === 'SUCCEEDED' && (
+                          <>
+                            <button
+                              className="ghost"
+                              style={{ padding: '4px 10px', fontSize: '11px', color: '#1d4ed8', borderColor: '#cfe0ff', background: '#edf4ff' }}
+                              onClick={() => {
+                                setRefundingIntentId(intent.id);
+                                setRefundAmount((intent.amount / 100).toString());
+                              }}
+                            >
+                              Refund
+                            </button>
+                            <button
+                              className="ghost"
+                              style={{ padding: '4px 10px', fontSize: '11px', color: '#be123c', borderColor: '#ffe4e6', background: '#fff1f2' }}
+                              onClick={() => handleSimulateDispute(intent.id)}
+                            >
+                              Dispute
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {intents.length === 0 && (
+                  <tr>
+                    <td colSpan={6} style={{ textAlign: 'center', padding: '24px', color: '#64748b' }}>
+                      No payments found.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         {/* Payments Sidebar List + API Credentials Card */}
@@ -1495,79 +1483,6 @@ function MerchantDashboard({ state, api, handleLogout, updateState }) {
 
       {/* Main Lists Section */}
       <section style={{ marginTop: '30px' }}>
-        <div className="table-container">
-          <div className="table-header">
-            <h3>Payments Log</h3>
-            <button className="ghost" onClick={fetchData}>
-              Refresh
-            </button>
-          </div>
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Intent ID</th>
-                <th>Customer</th>
-                <th>Amount</th>
-                <th>Capture</th>
-                <th>Status</th>
-                <th>Date</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {intents.map((intent) => (
-                <tr key={intent.id}>
-                  <td style={{ fontFamily: 'monospace' }}>{intent.id.slice(0, 13)}...</td>
-                  <td>{intent.customer?.name || 'Anonymous'}</td>
-                  <td>{formatCurrency(intent.amount, intent.currency)}</td>
-                  <td>{intent.captureMethod}</td>
-                  <td>
-                    <span className={`status-badge ${intent.status.toLowerCase()}`}>
-                      {intent.status}
-                    </span>
-                  </td>
-                  <td>{new Date(intent.createdAt).toLocaleDateString()}</td>
-                  <td>
-                    <div style={{ display: 'flex', gap: '6px' }}>
-                      <button className="ghost" style={{ padding: '4px 10px', fontSize: '11px' }} onClick={() => setSelectedIntent(intent)}>
-                        View
-                      </button>
-                      {intent.status === 'SUCCEEDED' && (
-                        <>
-                          <button
-                            className="ghost"
-                            style={{ padding: '4px 10px', fontSize: '11px', color: '#1d4ed8', borderColor: '#cfe0ff', background: '#edf4ff' }}
-                            onClick={() => {
-                              setRefundingIntentId(intent.id);
-                              setRefundAmount((intent.amount / 100).toString());
-                            }}
-                          >
-                            Refund
-                          </button>
-                          <button
-                            className="ghost"
-                            style={{ padding: '4px 10px', fontSize: '11px', color: '#be123c', borderColor: '#ffe4e6', background: '#fff1f2' }}
-                            onClick={() => handleSimulateDispute(intent.id)}
-                          >
-                            Dispute
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {intents.length === 0 && (
-                <tr>
-                  <td colSpan={7} style={{ textAlign: 'center', padding: '24px', color: '#64748b' }}>
-                    No payments found. Create one above to test!
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
         {/* Disputes Log Section */}
         <div className="table-container" style={{ marginTop: '28px' }}>
           <div className="table-header">
