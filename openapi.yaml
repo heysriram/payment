@@ -1,0 +1,1343 @@
+openapi: 3.0.3
+info:
+  title: Payment Gateway API
+  version: 1.0.0
+  description: |
+    Stripe-style REST API for the in-house payment gateway.
+
+    ## Authentication
+
+    Two parallel auth systems:
+
+    | Use case | Header |
+    |----------|--------|
+    | Merchant API consumers | `Authorization: Bearer sk_test_xxx_yyy` (or `sk_live_…`) |
+    | Dashboard sessions | `Authorization: Bearer <jwt>` (issued by `/auth/login` + `/auth/totp/verify`) |
+
+    Public keys (`pk_test_…` / `pk_live_…`) are restricted to the `tokenize` scope and are safe to ship to the browser.
+
+    ## Idempotency
+
+    Every `POST /v1/payment_intents` request **must** include an `Idempotency-Key` header.
+    Replaying with the same `(merchantId, idempotencyKey)` returns the original payment intent.
+
+    ## Pagination
+
+    List endpoints use cursor-based pagination:
+
+    ```
+    GET /v1/customers?limit=20&cursor=cus_abc123
+    → { data: [...], has_more: true, next_cursor: "cus_xyz789" }
+    ```
+
+    ## Errors
+
+    All errors follow a consistent shape:
+
+    ```json
+    { "error": { "code": "validation_error", "message": "...", "param": "amount" } }
+    ```
+  contact:
+    name: Payments Engineering
+    email: payments@example.com
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+  - url: https://sandbox.payments.example.com/api/v1
+    description: Sandbox
+  - url: https://api.payments.example.com/api/v1
+    description: Production
+
+tags:
+  - name: Authentication
+    description: Dashboard login, TOTP 2FA
+  - name: Merchants
+    description: Merchant onboarding and self-service dashboard
+  - name: API Keys
+    description: Create, list, and revoke API keys
+  - name: Customers
+    description: Manage your customers
+  - name: Payment Methods
+    description: Token-based payment method storage (PCI-safe)
+  - name: Payment Intents
+    description: Authorise, confirm, capture, cancel, refund payments
+  - name: Wallets
+    description: Customer-facing wallet (top-up, withdraw, history)
+  - name: Disputes
+    description: Chargeback workflow
+  - name: Payouts
+    description: Settle pending balance and withdraw to bank
+  - name: Webhooks
+    description: Register endpoints, view delivery logs, retry failed deliveries
+  - name: Events
+    description: Append-only event store + replay API
+  - name: Health
+    description: Liveness and readiness probes
+
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: api_key
+      description: |
+        Merchant API key. Format: `sk_test_xxx_yyy` or `sk_live_xxx_yyy`.
+        Public keys (`pk_…`) are restricted to the `tokenize` scope.
+    jwtAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Dashboard session JWT issued by `POST /auth/login` (partial)
+        and elevated by `POST /auth/totp/verify` (full).
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      description: |
+        Unique key per logical request. Replaying the same key returns the
+        original response without creating a new payment.
+    LimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    CursorParam:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: ID of the last item in the previous page
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: validation_error
+            message:
+              type: string
+            param:
+              type: string
+              nullable: true
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  param: { type: string }
+                  message: { type: string }
+
+    Merchant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        legalName: { type: string }
+        gst: { type: string, nullable: true }
+        pan: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [PENDING, APPROVED, SUSPENDED]
+        createdAt: { type: string, format: date-time }
+
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        keyId: { type: string, example: sk_test_a1b2c3d4 }
+        mode:
+          type: string
+          enum: [TEST, LIVE]
+        scopes:
+          type: array
+          items: { type: string }
+        lastUsedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt: { type: string, format: date-time }
+        isRevoked: { type: boolean }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        externalId: { type: string }
+        email: { type: string, format: email, nullable: true }
+        phone: { type: string, nullable: true }
+        name: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    PaymentMethod:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customerId: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [CARD, UPI, NETBANKING, WALLET, BANK_ACCOUNT]
+        tokenId: { type: string }
+        brand: { type: string, nullable: true }
+        last4: { type: string, nullable: true }
+        expMonth: { type: integer, nullable: true }
+        expYear: { type: integer, nullable: true }
+        isInternational: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    PaymentIntent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        customerId: { type: string, format: uuid, nullable: true }
+        paymentMethodId: { type: string, format: uuid, nullable: true }
+        amount:
+          type: integer
+          description: Smallest currency unit (paise for INR)
+          example: 50000
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          example: INR
+        status:
+          type: string
+          enum:
+            - REQUIRES_PM
+            - REQUIRES_CONFIRMATION
+            - REQUIRES_ACTION
+            - PROCESSING
+            - SUCCEEDED
+            - CANCELLED
+            - FAILED
+        clientSecret:
+          type: string
+          description: |
+            Returned **once** on create. Used by the public checkout to confirm
+            payment without exposing the merchant's secret key.
+        captureMethod:
+          type: string
+          enum: [AUTOMATIC, MANUAL]
+        metadata:
+          type: object
+          additionalProperties: true
+          nullable: true
+        createdAt: { type: string, format: date-time }
+
+    Refund:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        transactionId: { type: string, format: uuid }
+        amount: { type: integer }
+        reason: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, SUCCEEDED, FAILED, CANCELLED]
+        gatewayRefundId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    Dispute:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        transactionId: { type: string, format: uuid }
+        amount: { type: integer }
+        reasonCode: { type: string }
+        status:
+          type: string
+          enum: [NEEDS_RESPONSE, UNDER_REVIEW, WON, LOST]
+        dueBy: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    Payout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        amount: { type: integer }
+        currency: { type: string }
+        status:
+          type: string
+          enum: [SCHEDULED, PROCESSING, PAID, FAILED, CANCELLED]
+        bankRef: { type: string, nullable: true }
+        scheduledFor: { type: string, format: date-time }
+        paidAt: { type: string, format: date-time, nullable: true }
+
+    Balance:
+      type: object
+      properties:
+        balance:
+          type: object
+          properties:
+            available: { type: integer }
+            pending: { type: integer }
+
+    Webhook:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        events:
+          type: array
+          items: { type: string }
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED, FAILING]
+        createdAt: { type: string, format: date-time }
+
+    Event:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, example: payment_intent.succeeded }
+        apiVersion: { type: string, example: v1 }
+        payload:
+          type: object
+          additionalProperties: true
+        createdAt: { type: string, format: date-time }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        webhookId: { type: string, format: uuid }
+        eventId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [PENDING, DELIVERED, FAILED]
+        attempts: { type: integer }
+        nextAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+        responseCode:
+          type: integer
+          nullable: true
+
+    PaginatedCustomers:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Customer' }
+        has_more: { type: boolean }
+        next_cursor:
+          type: string
+          nullable: true
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Caller is authenticated but lacks the required scope/role
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Resource already exists
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      security: []
+      servers:
+        - url: http://localhost:3000/api
+        - url: https://sandbox.payments.example.com/api
+        - url: https://api.payments.example.com/api
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  timestamp: { type: string, format: date-time }
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe (checks Postgres + Redis)
+      security: []
+      servers:
+        - url: http://localhost:3000/api
+        - url: https://sandbox.payments.example.com/api
+        - url: https://api.payments.example.com/api
+      responses:
+        '200':
+          description: All dependencies reachable
+        '503':
+          description: One or more dependencies unhealthy
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login with email + password
+      description: Returns a partial JWT. The full session is issued only after `/auth/totp/verify`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        '200':
+          description: Partial JWT issued; TOTP verification required next.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  requiresTotp: { type: boolean }
+                  totpUri:
+                    type: string
+                    description: Returned only on first login, scan with Google Authenticator.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/totp/verify:
+    post:
+      tags: [Authentication]
+      summary: Verify TOTP code and elevate session
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, pattern: '^\d{6}$' }
+      responses:
+        '200':
+          description: "Full JWT (`totpVerified`: true)"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /merchants/register:
+    post:
+      tags: [Merchants]
+      summary: Register a new merchant + owner user + initial test API keys
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, legalName, email, password]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100 }
+                legalName: { type: string, minLength: 2, maxLength: 200 }
+                gst: { type: string, example: '27ABCDE1234F1Z5' }
+                pan: { type: string, example: 'ABCDE1234F' }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 12 }
+      responses:
+        '201':
+          description: Merchant created with two test keys (a secret key and a public tokenize key).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: '#/components/schemas/Merchant' }
+                  apiKeys:
+                    type: object
+                    properties:
+                      test:
+                        type: object
+                        properties:
+                          secretKey: { type: string, example: sk_test_xxx_yyy }
+                          publicKey: { type: string, example: pk_test_xxx_yyy }
+                      note: { type: string }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /merchants/me:
+    get:
+      tags: [Merchants]
+      summary: Get the authenticated merchant's profile
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Merchant profile with active fee plan.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /merchants/balance:
+    get:
+      tags: [Merchants]
+      summary: Get available + pending balance (INR, paise)
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Balance snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balance' }
+
+  /merchants/payment-intents:
+    get:
+      tags: [Merchants]
+      summary: List the merchant's payment intents (dashboard view)
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Array of payment intents with customer/method joined.
+    post:
+      tags: [Merchants]
+      summary: Create a payment intent from the dashboard
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 100 }
+                currency: { type: string, default: INR }
+                customerId: { type: string, format: uuid }
+                captureMethod:
+                  type: string
+                  enum: [AUTOMATIC, MANUAL]
+                  default: AUTOMATIC
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paymentIntent: { $ref: '#/components/schemas/PaymentIntent' }
+
+  /merchants/transactions:
+    get:
+      tags: [Merchants]
+      summary: List transactions (capture/refund/void) for the merchant
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Transactions plus ledger-derived debit events (withdrawals, payouts).
+
+  /merchants/payment-intents/{id}/refund:
+    post:
+      tags: [Merchants]
+      summary: Refund a successful payment intent (dashboard)
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: integer
+                  description: Optional partial refund amount; defaults to remaining captured amount.
+                reason: { type: string }
+      responses:
+        '200':
+          description: Refund created and ledger updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  refund: { $ref: '#/components/schemas/Refund' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /merchants/settle:
+    post:
+      tags: [Payouts]
+      summary: Move PENDING balance to AVAILABLE (simulated settlement)
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Payout record created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payout: { $ref: '#/components/schemas/Payout' }
+
+  /merchants/payout:
+    post:
+      tags: [Payouts]
+      summary: Withdraw AVAILABLE balance to merchant bank
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Payout created and ledger debited.
+
+  /merchants/payment-intents/{id}/dispute:
+    post:
+      tags: [Disputes]
+      summary: Open a simulated chargeback against a successful payment
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Dispute opened, AVAILABLE → DISPUTES.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dispute: { $ref: '#/components/schemas/Dispute' }
+
+  /merchants/disputes/{id}/resolve:
+    post:
+      tags: [Disputes]
+      summary: Resolve a dispute as WON or LOST
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [WON, LOST]
+      responses:
+        '200':
+          description: Dispute resolved.
+
+  /merchants/disputes:
+    get:
+      tags: [Disputes]
+      summary: List disputes for the merchant
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Disputes with associated payment intent.
+
+  /merchants/wallets:
+    get:
+      tags: [Wallets]
+      summary: List all customers and their wallet balances
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Customer wallets snapshot.
+
+  /merchants/customers/{customerId}/wallet-transactions:
+    get:
+      tags: [Wallets]
+      summary: List wallet transactions for a customer
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: customerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Wallet transaction log (Redis).
+
+  /api-keys:
+    get:
+      tags: [API Keys]
+      summary: List API keys for the authenticated merchant
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: API key list (no secrets).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApiKey' }
+                  count: { type: integer }
+    post:
+      tags: [API Keys]
+      summary: Create a new API key (OWNER/ADMIN only)
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode, scopes]
+              properties:
+                mode:
+                  type: string
+                  enum: [TEST, LIVE]
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                    enum:
+                      - payments:write
+                      - payments:read
+                      - refunds:write
+                      - refunds:read
+                      - customers:write
+                      - customers:read
+                      - tokenize
+                isSecret: { type: boolean, default: true }
+      responses:
+        '201':
+          description: |
+            Key created. The `secret` field is returned **once** and cannot be retrieved later.
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api-keys/{id}:
+    delete:
+      tags: [API Keys]
+      summary: Revoke an API key
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Revoked.
+
+  /customers:
+    get:
+      tags: [Customers]
+      summary: List customers (cursor pagination)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/CursorParam'
+      responses:
+        '200':
+          description: Paged customer list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaginatedCustomers' }
+    post:
+      tags: [Customers]
+      summary: Create a customer
+      security: [{ apiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [externalId]
+              properties:
+                externalId: { type: string, minLength: 1, maxLength: 200 }
+                email: { type: string, format: email }
+                phone: { type: string, example: '+919876543210' }
+                name: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Customer created.
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Get a customer by ID (with attached payment methods)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Customer detail.
+
+  /payment_methods:
+    post:
+      tags: [Payment Methods]
+      summary: Attach a tokenised payment method to a customer
+      description: |
+        **PCI-safe**: this endpoint accepts a vault `tokenId` (e.g. from Razorpay /
+        Stripe Vault) — it does **not** accept PAN, CVV, or any card data.
+
+        Public keys (`pk_…`) with the `tokenize` scope can call this from the browser.
+      security: [{ apiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerId, tokenId, type]
+              properties:
+                customerId: { type: string, format: uuid }
+                tokenId: { type: string, minLength: 1 }
+                type:
+                  type: string
+                  enum: [CARD, UPI, NETBANKING, WALLET, BANK_ACCOUNT]
+                brand: { type: string }
+                last4: { type: string, minLength: 4, maxLength: 4 }
+                expMonth: { type: integer, minimum: 1, maximum: 12 }
+                expYear: { type: integer, minimum: 2024 }
+                isInternational: { type: boolean, default: false }
+                fingerprint: { type: string }
+      responses:
+        '201':
+          description: Payment method attached.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paymentMethod: { $ref: '#/components/schemas/PaymentMethod' }
+
+  /payment_methods/{id}:
+    delete:
+      tags: [Payment Methods]
+      summary: Detach (delete) a payment method
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deleted.
+
+  /payment_intents:
+    post:
+      tags: [Payment Intents]
+      summary: Create a payment intent
+      description: |
+        Creates a payment intent and (in test/live with Razorpay configured) creates an
+        upstream Razorpay Order. The returned `clientSecret` is used by the
+        public checkout to confirm payment without the merchant secret key.
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 100 }
+                currency: { type: string, default: INR }
+                customerId: { type: string, format: uuid }
+                captureMethod:
+                  type: string
+                  enum: [AUTOMATIC, MANUAL]
+                  default: AUTOMATIC
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        '201':
+          description: Payment intent created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paymentIntent: { $ref: '#/components/schemas/PaymentIntent' }
+        '200':
+          description: Idempotent replay — same `(merchantId, idempotencyKey)` returned.
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /payment_intents/{id}/confirm:
+    post:
+      tags: [Payment Intents]
+      summary: Confirm a payment intent
+      description: |
+        Two flows:
+
+        1. **Razorpay flow** — pass `razorpay_payment_id`, `razorpay_order_id`, `razorpay_signature`.
+           The HMAC SHA-256 signature is verified server-side.
+        2. **Vault tokenisation flow** — pass `paymentMethodId` (uuid).
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [razorpay_payment_id, razorpay_order_id, razorpay_signature]
+                  properties:
+                    razorpay_payment_id: { type: string }
+                    razorpay_order_id: { type: string }
+                    razorpay_signature: { type: string }
+                - type: object
+                  required: [paymentMethodId]
+                  properties:
+                    paymentMethodId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Intent confirmed; status moves to SUCCEEDED, REQUIRES_ACTION, or PROCESSING.
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '402':
+          description: Card declined.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /payment_intents/{id}/capture:
+    post:
+      tags: [Payment Intents]
+      summary: Manual capture for an authorised intent
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Captured. Ledger receives PROCESSOR/PENDING/FEES entries.
+
+  /payment_intents/{id}/cancel:
+    post:
+      tags: [Payment Intents]
+      summary: Cancel an unconfirmed payment intent
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Intent cancelled and a VOID transaction is recorded.
+
+  /payment_intents/{id}/refund:
+    post:
+      tags: [Payment Intents]
+      summary: Refund a captured payment intent
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, minimum: 1 }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Refund created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  refund: { $ref: '#/components/schemas/Refund' }
+
+  /payment_intents/{id}/public:
+    get:
+      tags: [Payment Intents]
+      summary: Public details for the checkout page
+      description: Returns merchant name, amount, and Razorpay order id, validated against `client_secret`.
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: client_secret, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Public intent payload.
+
+  /payment_intents/{id}/confirm/public:
+    post:
+      tags: [Payment Intents]
+      summary: Public confirm (used by the Razorpay Checkout iframe)
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_secret, razorpay_payment_id, razorpay_order_id, razorpay_signature]
+              properties:
+                client_secret: { type: string }
+                razorpay_payment_id: { type: string }
+                razorpay_order_id: { type: string }
+                razorpay_signature: { type: string }
+      responses:
+        '200':
+          description: Captured.
+
+  /payment_intents/{id}/confirm/dummy:
+    post:
+      tags: [Payment Intents]
+      summary: Public confirm with a simulated outcome (no Razorpay)
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_secret]
+              properties:
+                client_secret: { type: string }
+                outcome:
+                  type: string
+                  enum: [SUCCESS, FAILURE_DECLINED, FAILURE_REVERTED]
+                  default: SUCCESS
+                payment_method:
+                  type: string
+                  default: card
+      responses:
+        '200':
+          description: Outcome applied to ledger and intent state.
+
+  /customers/register/public:
+    post:
+      tags: [Customers]
+      summary: Public customer self-registration (no API key)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name]
+              properties:
+                email: { type: string, format: email }
+                name: { type: string }
+                phone: { type: string }
+      responses:
+        '201':
+          description: Customer created.
+        '200':
+          description: Existing customer returned (idempotent).
+
+  /customers/login/public:
+    post:
+      tags: [Customers]
+      summary: Public customer login by email
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200':
+          description: Customer found.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /customers/{id}/wallet/public:
+    get:
+      tags: [Wallets]
+      summary: Public wallet balance + transaction list
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Wallet snapshot.
+
+  /customers/{id}/wallet/order/public:
+    post:
+      tags: [Wallets]
+      summary: Create a Razorpay Order for wallet top-up
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 100 }
+      responses:
+        '200':
+          description: Order ID + Razorpay key id.
+
+  /customers/{id}/wallet/topup/public:
+    post:
+      tags: [Wallets]
+      summary: Confirm Razorpay payment and credit the wallet
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, razorpay_payment_id, razorpay_order_id, razorpay_signature]
+              properties:
+                amount: { type: integer, minimum: 1 }
+                razorpay_payment_id: { type: string }
+                razorpay_order_id: { type: string }
+                razorpay_signature: { type: string }
+      responses:
+        '200':
+          description: Wallet credited.
+
+  /customers/{id}/wallet/withdraw/public:
+    post:
+      tags: [Wallets]
+      summary: Withdraw from wallet
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Wallet debited.
+
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhooks for the merchant
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Webhook list (with delivery counts).
+    post:
+      tags: [Webhooks]
+      summary: Register a new webhook endpoint
+      description: |
+        Returns the **plaintext** signing secret exactly once.
+        Verify incoming events using the `X-Payments-Signature` header — see
+        [signature spec](#section/Webhook-signatures).
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  items: { type: string }
+      responses:
+        '201':
+          description: Webhook registered, secret returned once.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook: { $ref: '#/components/schemas/Webhook' }
+                  secret: { type: string, example: whsec_xxx }
+                  note: { type: string }
+
+  /webhooks/{id}:
+    patch:
+      tags: [Webhooks]
+      summary: Update a webhook (URL, events, status)
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  items: { type: string }
+                status:
+                  type: string
+                  enum: [ACTIVE, DISABLED]
+      responses:
+        '200':
+          description: Updated.
+    delete:
+      tags: [Webhooks]
+      summary: Delete a webhook
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deleted.
+
+  /webhooks/{id}/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Per-webhook delivery log
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200':
+          description: Recent deliveries for this webhook.
+
+  /webhooks/{id}/deliveries/{deliveryId}/retry:
+    post:
+      tags: [Webhooks]
+      summary: Re-queue a failed or pending delivery
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: deliveryId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Re-queued.
+
+  /webhooks/{id}/test:
+    post:
+      tags: [Webhooks]
+      summary: Send a synthetic webhook.test event to this endpoint
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Test event enqueued for delivery.
+
+  /events:
+    get:
+      tags: [Events]
+      summary: Replay / inspect events for the merchant
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: type, in: query, schema: { type: string }, description: 'Exact event type filter, e.g. payment_intent.succeeded' }
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: until, in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Cursor-paginated events.
+
+  /events/{id}:
+    get:
+      tags: [Events]
+      summary: Get an event by ID, with its delivery attempts
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Event detail with deliveries array.
+
+  /customers/{id}/wallet/topup/dummy:
+    post:
+      tags: [Wallets]
+      summary: Public wallet top-up with a simulated outcome (no Razorpay)
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 1 }
+                outcome:
+                  type: string
+                  enum: [SUCCESS, FAILURE_DECLINED, FAILURE_REVERTED]
+                  default: SUCCESS
+                payment_method:
+                  type: string
+                  default: card
+      responses:
+        '200':
+          description: Outcome applied.
+
+security:
+  - apiKeyAuth: []
