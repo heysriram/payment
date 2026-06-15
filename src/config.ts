@@ -25,6 +25,10 @@ const envSchema = z.object({
 
   RATE_LIMIT_WINDOW_MS: positiveInteger.default('60000'),
   RATE_LIMIT_MAX_REQUESTS: positiveInteger.default('100'),
+
+  // Run the webhook worker in the API process (true for dev/local; false in production
+  // where the worker should run as a separate deployment for backpressure isolation).
+  WEBHOOKS_RUN_INPROCESS: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
 }).superRefine((env, ctx) => {
   if (env.NODE_ENV === 'production') {
     for (const key of ['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET'] as const) {

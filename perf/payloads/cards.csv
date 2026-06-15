@@ -1,0 +1,11 @@
+card_last4,card_network,card_token
+4242,VISA,tok_visa_4242
+4444,MASTERCARD,tok_mc_4444
+0005,AMEX,tok_amex_0005
+1117,DISCOVER,tok_disc_1117
+5556,VISA,tok_visa_5556
+8210,MASTERCARD,tok_mc_8210
+1881,VISA,tok_visa_1881
+9990,RUPAY,tok_rupay_9990
+0341,VISA,tok_visa_0341
+0086,VISA,tok_visa_0086

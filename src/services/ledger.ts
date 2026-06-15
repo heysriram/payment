@@ -1,5 +1,6 @@
 import { PrismaClient, LedgerAccount } from '@prisma/client';
 import { redis } from '../redis';
+import { ledgerEntriesPosted } from '../middleware/metrics';
 
 type TxClient = Omit<
   PrismaClient,
@@ -39,6 +40,10 @@ export async function postLedgerEntries(
       refId: e.refId,
     })),
   });
+
+  for (const e of entries) {
+    ledgerEntriesPosted.inc({ account: e.account, currency: e.currency });
+  }
 
   // Bust Redis balance cache
   await bustBalanceCache(merchantId, entries[0].currency).catch(() => {});

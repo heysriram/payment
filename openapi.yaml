@@ -613,6 +613,223 @@ paths:
         '400': { $ref: '#/components/responses/ValidationError' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /merchants/customers:
+    get:
+      tags: [Merchants]
+      summary: List all customers the merchant has interacted with
+      description: |
+        Returns every customer either owned by this merchant or who has ever
+        paid them. Aggregates (`totalSpent`, `totalPayments`, `lastPaymentAt`)
+        are scoped to this merchant only — a customer's spend with another
+        merchant does not bleed into your numbers. Powers the merchant
+        dashboard's "All Customers" panel.
+      security: [{ jwtAuth: [] }]
+      responses:
+        '200':
+          description: Customers and aggregates.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string, nullable: true }
+                        email: { type: string, format: email, nullable: true }
+                        phone: { type: string, nullable: true }
+                        createdAt: { type: string, format: date-time }
+                        walletBalance: { type: integer, description: paise }
+                        totalSpent: { type: integer, description: paise across SUCCEEDED intents with this merchant }
+                        totalPayments: { type: integer, description: count of intents with this merchant (any status) }
+                        successfulPayments: { type: integer }
+                        paymentMethodCount: { type: integer }
+                        lastPaymentAt: { type: string, format: date-time, nullable: true }
+                        currency: { type: string, example: INR }
+                        isOwnCustomer:
+                          type: boolean
+                          description: |
+                            true if `customer.merchantId === merchant`, false if
+                            the customer's home merchant is different but they
+                            paid you anyway (e.g. via the public checkout link).
+    post:
+      tags: [Merchants, Customers]
+      summary: Create a customer (dashboard JWT)
+      description: |
+        Dashboard-friendly equivalent of POST /customers. The merchant JWT
+        replaces the customers:write API key. `externalId` is optional —
+        when omitted, the server auto-generates one (`cust_<random>`).
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                externalId: { type: string }
+                name: { type: string }
+                email: { type: string, format: email }
+                phone: { type: string }
+      responses:
+        '201':
+          description: Customer created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customer: { $ref: '#/components/schemas/Customer' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /merchants/customers/{id}:
+    get:
+      tags: [Merchants, Customers]
+      summary: Customer drill-down (dashboard JWT)
+      description: |
+        Returns full profile + payment methods + recent intents (scoped to
+        this merchant) + wallet balance. Visible if the customer is owned
+        by this merchant OR has paid them at least once.
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Customer detail.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /merchants/customers-search:
+    get:
+      tags: [Merchants, Customers]
+      summary: Global customer search across the database
+      description: |
+        Searches the GLOBAL customer table (all merchants).
+
+        Two modes:
+          * Default (`include_own=false`): excludes customers owned by the
+            calling merchant. Powers the "Import existing customer" modal.
+          * `include_own=true`: returns ALL customers (own + guests + others).
+            Powers the "Create Payment Link" customer dropdown so any
+            customer in the database is selectable.
+
+        Each row carries an `isOwnCustomer` boolean for grouping. Guests
+        whose email already exists under the calling merchant are flagged
+        with `alreadyImported` so the import UI can warn before duplicating.
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: Free-text query — matches name, email, phone, or externalId (case-insensitive).
+        - name: include_own
+          in: query
+          required: false
+          schema: { type: string, enum: ['true', 'false'], default: 'false' }
+          description: Set to `true` to include the calling merchant's own customers.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 25 }
+      responses:
+        '200':
+          description: Candidate customers up to `limit`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string, nullable: true }
+                        email: { type: string, nullable: true }
+                        phone: { type: string, nullable: true }
+                        createdAt: { type: string, format: date-time }
+                        isOwnCustomer:
+                          type: boolean
+                          description: True if the customer is owned by the calling merchant.
+                        alreadyImported:
+                          type: boolean
+                          description: True if a guest's email already exists under this merchant (always false for own customers).
+
+  /merchants/customers/import:
+    post:
+      tags: [Merchants, Customers]
+      summary: Copy a global customer into this merchant's roster
+      description: |
+        Non-destructive import. The source customer is left untouched. A new
+        owned customer is created under the calling merchant with the source's
+        name / email / phone copied over and a fresh `externalId`
+        (`cust_imported_<hex>`). Future invoices reference the new owned
+        record; past "guest" payments continue to link the source record.
+
+        Refuses (409) if a customer with the same email already exists under
+        this merchant.
+      security: [{ jwtAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceCustomerId]
+              properties:
+                sourceCustomerId: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Imported customer created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customer: { $ref: '#/components/schemas/Customer' }
+                  sourceCustomerId: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /merchants/payment-intents/{id}/capture:
+    post:
+      tags: [Merchants]
+      summary: Capture a manually-authorised payment intent (dashboard)
+      description: |
+        Dashboard-friendly equivalent of POST /payment_intents/{id}/capture.
+        Only valid when `captureMethod=MANUAL` and the intent is in
+        `PROCESSING`. Posts the CAPTURE transaction and updates the ledger.
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Capture posted; intent moved to SUCCEEDED.
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /merchants/payment-intents/{id}/cancel:
+    post:
+      tags: [Merchants]
+      summary: Cancel an unfinished payment intent (dashboard)
+      description: |
+        Dashboard-friendly equivalent of POST /payment_intents/{id}/cancel.
+        Allowed for any intent that is not yet SUCCEEDED, CANCELLED, FAILED,
+        or PROCESSING. Records a VOID transaction.
+      security: [{ jwtAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Intent cancelled; VOID transaction recorded.
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /merchants/settle:
     post:
       tags: [Payouts]
@@ -1003,7 +1220,10 @@ paths:
     get:
       tags: [Payment Intents]
       summary: Public details for the checkout page
-      description: Returns merchant name, amount, and Razorpay order id, validated against `client_secret`.
+      description: |
+        Returns merchant name, amount, Razorpay order id, and `customerId`
+        (so the hosted checkout can decide whether to surface a saved-method
+        picker), validated against `client_secret`.
       security: []
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
@@ -1011,6 +1231,47 @@ paths:
       responses:
         '200':
           description: Public intent payload.
+
+  /payment_intents/{id}/checkout_link/public:
+    post:
+      tags: [Payment Intents]
+      summary: Mint a fresh client_secret so a customer can pay their pending invoice
+      description: |
+        Lets the customer dashboard generate a payable checkout URL for any
+        of the customer's own pending intents. The trust model is the same
+        as other customer-side `/public` endpoints — possession of the
+        customer's UUID is sufficient.
+
+        Rotates the stored `client_secret` hash, so any previously-shared
+        merchant link becomes invalid as soon as the customer clicks
+        "Pay Now" from their dashboard. The intent is single-use; we want
+        the most recent payer to win cleanly.
+
+        Refuses (400) if the intent is in SUCCEEDED, CANCELLED, or FAILED.
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerId]
+              properties:
+                customerId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Fresh client_secret for the intent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  intentId: { type: string, format: uuid }
+                  clientSecret: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /payment_intents/{id}/confirm/public:
     post:
@@ -1058,6 +1319,14 @@ paths:
                 payment_method:
                   type: string
                   default: card
+                payment_method_id:
+                  type: string
+                  format: uuid
+                  description: |
+                    Optional. When set, re-uses an existing saved PaymentMethod
+                    that already belongs to this intent's customer instead of
+                    fabricating a new one. Lets the hosted checkout offer a
+                    "Pay with saved card" UX.
       responses:
         '200':
           description: Outcome applied to ledger and intent state.
@@ -1101,6 +1370,24 @@ paths:
       responses:
         '200':
           description: Customer found.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /customers/{id}/methods/{methodId}/public:
+    delete:
+      tags: [Customers]
+      summary: Customer-portal removal of a saved payment method
+      description: |
+        Auth model is "owner-by-knowledge-of-id" — both the customer ID and
+        method ID must match. The same trust model applies to other /public
+        flows on this router (the customer portal does not hold a JWT or API
+        key; it only knows the customer ID it was logged in with).
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: methodId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Method deleted.
         '404': { $ref: '#/components/responses/NotFound' }
 
   /customers/{id}/wallet/public:

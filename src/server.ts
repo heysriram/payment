@@ -3,9 +3,18 @@ import { config } from './config';
 import { logger } from './middleware/logger';
 import { prisma } from './db';
 import { redis } from './redis';
+import { startWebhookWorker } from './workers/webhookWorker';
+import type { Worker } from 'bullmq';
 
 async function main(): Promise<void> {
   const app = createApp();
+
+  let webhookWorker: Worker | null = null;
+  if (config.WEBHOOKS_RUN_INPROCESS) {
+    webhookWorker = startWebhookWorker();
+  } else {
+    logger.info('Webhook worker disabled in-process; expecting separate `npm run worker:webhooks` deploy');
+  }
 
   const server = app.listen(config.PORT, () => {
     logger.info(
@@ -19,6 +28,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutdown signal received');
 
     server.close(async () => {
+      if (webhookWorker) await webhookWorker.close();
       await prisma.$disconnect();
       redis.disconnect();
       logger.info('Server shut down cleanly');

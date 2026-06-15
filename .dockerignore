@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+.DS_Store
+frontend/node_modules
+frontend/dist
+test/fixtures
+playwright-report
+newman-report.html

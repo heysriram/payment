@@ -149,6 +149,7 @@ model Merchant {
   ledgerEntries  LedgerEntry[]
   webhooks       Webhook[]
   auditLogs      AuditLog[]
+  events         Event[]
 
   @@map("merchants")
 }
@@ -365,14 +366,35 @@ model WebhookDelivery {
   eventId       String
   status        DeliveryStatus @default(PENDING)
   attempts      Int            @default(0)
+  nextAttemptAt DateTime?
   lastAttemptAt DateTime?
   responseCode  Int?
   responseBody  String?
+  createdAt     DateTime       @default(now())
 
   webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  event   Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
 
   @@index([webhookId, status])
+  @@index([status, nextAttemptAt])
   @@map("webhook_deliveries")
+}
+
+/// Append-only event log. Powers the replay API and the webhook delivery worker.
+model Event {
+  id         String   @id @default(uuid())
+  merchantId String
+  type       String // e.g. "payment_intent.succeeded"
+  payload    Json
+  apiVersion String   @default("v1")
+  createdAt  DateTime @default(now())
+
+  merchant   Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([merchantId, type, createdAt])
+  @@index([merchantId, createdAt])
+  @@map("events")
 }
 
 // ─────────────────────────────────────────────

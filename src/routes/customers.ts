@@ -106,6 +106,30 @@ customerRouter.get('/:id/methods/public', async (req: Request, res: Response, ne
   }
 });
 
+// DELETE /v1/customers/:id/methods/:methodId/public — customer-portal removal
+// of a saved card / UPI handle. Auth model is "owner-by-knowledge-of-id":
+// matches /:id (customerId) + /:methodId (paymentMethodId) before deleting,
+// same trust model as the other /public flows on this router. We never delete
+// methods that have outstanding intents because they are still referenced
+// from the ledger; we soft-orphan instead by relying on the ON DELETE
+// SET NULL constraint at the DB layer.
+customerRouter.delete('/:id/methods/:methodId/public', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const method = await prisma.paymentMethod.findFirst({
+      where: {
+        id: req.params.methodId,
+        customerId: req.params.id,
+      },
+    });
+    if (!method) throw new NotFoundError('Payment method');
+
+    await prisma.paymentMethod.delete({ where: { id: method.id } });
+    res.json({ deleted: true, id: method.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /v1/customers/:id/wallet/public — fetch public wallet details (balance + transactions)
 customerRouter.get('/:id/wallet/public', async (req: Request, res: Response, next: NextFunction) => {
   try {

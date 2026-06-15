@@ -1,0 +1,169 @@
+# Artillery scenario: realistic merchant checkout flow.
+#
+# Unlike the k6 hot-path test (which only hammers POST /payment_intents),
+# this scenario walks through a full lifecycle:
+#   register merchant once  →  many VUs reuse the secret key
+#       → create customer
+#       → attach payment method
+#       → create payment intent (with idempotency key)
+#       → confirm intent
+#       → list customer's payment methods
+#
+# Run:
+#   npx artillery run perf/artillery-checkout.yml -o perf/artillery-report.json
+#   npx artillery report perf/artillery-report.json   # render HTML
+#
+# CI tip: pass `--config '{ "ensure": { ... } }'` or rely on the inline
+# `ensure` block below to fail the build on SLO breach.
+
+config:
+  target: "{{ $env.BASE_URL || 'http://localhost:3000' }}"
+  phases:
+    - name: warmup
+      duration: 30
+      arrivalRate: 2
+    - name: ramp
+      duration: 60
+      arrivalRate: 5
+      rampTo: 50
+    - name: sustain
+      duration: 120
+      arrivalRate: 50
+    - name: cooldown
+      duration: 30
+      arrivalRate: 5
+  http:
+    timeout: 10
+  ensure:
+    # BRD NFR thresholds — fail the run if breached.
+    thresholds:
+      - http.response_time.p95: 3000
+      - http.response_time.p99: 5000
+      - http.codes.500: 0
+    maxErrorRate: 1
+  variables:
+    currencies: ["INR", "USD", "EUR"]
+  payload:
+    path: "perf/payloads/cards.csv"
+    fields:
+      - "card_last4"
+      - "card_network"
+      - "card_token"
+    skipHeader: true
+    cast: false
+    order: random
+
+before:
+  flow:
+    - log: "Bootstrapping shared merchant for the run…"
+    - post:
+        url: "/api/v1/merchants/register"
+        json:
+          name: "Artillery Merchant"
+          legalName: "Artillery Pvt Ltd"
+          email: "art-{{ $randomString() }}@perf.test"
+          password: "ArtilleryPass123!"
+        capture:
+          - json: "$.apiKeys.test.secretKey"
+            as: "secretKey"
+    - log: "Test secret key acquired."
+
+scenarios:
+  - name: checkout_lifecycle
+    weight: 8
+    flow:
+      - post:
+          url: "/api/v1/customers"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+          json:
+            email: "buyer-{{ $randomString() }}@perf.test"
+            name: "Perf Buyer"
+          capture:
+            - json: "$.customer.id"
+              as: "customerId"
+      - post:
+          url: "/api/v1/payment_methods"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+          json:
+            customerId: "{{ customerId }}"
+            type: "card"
+            card:
+              last4: "{{ card_last4 }}"
+              network: "{{ card_network }}"
+              token: "{{ card_token }}"
+          capture:
+            - json: "$.paymentMethod.id"
+              as: "pmId"
+      - post:
+          url: "/api/v1/payment_intents"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+            Idempotency-Key: "art_{{ $uuid }}"
+          json:
+            amount: "{{ $randomNumber(1000, 250000) }}"
+            currency: "{{ currencies[$randomNumber(0, 2)] }}"
+            customerId: "{{ customerId }}"
+            paymentMethodId: "{{ pmId }}"
+          capture:
+            - json: "$.paymentIntent.id"
+              as: "intentId"
+          expect:
+            - statusCode: [200, 201]
+            - hasProperty: "paymentIntent.id"
+      - post:
+          url: "/api/v1/payment_intents/{{ intentId }}/confirm"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+          expect:
+            - statusCode: [200, 202]
+      - get:
+          url: "/api/v1/customers/{{ customerId }}/payment_methods"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+          expect:
+            - statusCode: 200
+      - think: 1
+
+  - name: idempotency_replay
+    weight: 2
+    flow:
+      - post:
+          url: "/api/v1/customers"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+          json:
+            email: "replay-{{ $randomString() }}@perf.test"
+          capture:
+            - json: "$.customer.id"
+              as: "cId"
+      - post:
+          url: "/api/v1/payment_intents"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+            Idempotency-Key: "{{ $uuid }}"
+          json:
+            amount: 75000
+            currency: "INR"
+            customerId: "{{ cId }}"
+          capture:
+            - json: "$.paymentIntent.id"
+              as: "intentId"
+            - header: "idempotency-key"
+              as: "key"
+      # Replay the exact same idempotency key — must return the same intent.
+      - post:
+          url: "/api/v1/payment_intents"
+          headers:
+            Authorization: "Bearer {{ secretKey }}"
+            Idempotency-Key: "{{ key }}"
+          json:
+            amount: 75000
+            currency: "INR"
+            customerId: "{{ cId }}"
+          expect:
+            - statusCode: 200
+            - equals:
+                - "{{ paymentIntent.id }}"
+                - "{{ intentId }}"

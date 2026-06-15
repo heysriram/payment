@@ -5,6 +5,7 @@ import { requireApiKey, requireScope } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
 import { postCapture, postRefund, postLedgerEntries } from '../services/ledger';
 import { calculateFee } from '../services/fees';
+import { publishEvent, enqueueDueDeliveries } from '../services/events';
 import {
   NotFoundError,
   ValidationError,
@@ -49,10 +50,63 @@ paymentIntentRouter.get('/:id/public', async (req: Request, res: Response, next:
         currency: intent.currency,
         status: intent.status,
         merchantName: intent.merchant.name,
+        // customerId is required so the hosted checkout can decide whether
+        // to surface a "pay with saved method" picker. It's safe to expose:
+        // any party that knows the client_secret already knows whose intent
+        // they're looking at.
+        customerId: intent.customerId,
         metadata: intent.metadata,
         razorpayOrderId: (intent.metadata as any)?.razorpay_order_id || null,
         razorpayKeyId: config.RAZORPAY_KEY_ID,
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/payment_intents/:id/checkout_link/public — mint a fresh
+// client_secret for a customer's pending invoice so they can pay it from
+// their own dashboard.
+//
+// Trust model is the same as the rest of the customer-side `/public`
+// endpoints: any caller that can present the matching `customerId` for the
+// intent is treated as that customer. The customer dashboard stores the
+// customerId in localStorage on login and supplies it here.
+//
+// This rotates the stored client_secret hash, so any previously-shared
+// merchant link becomes invalid the moment the customer hits "Pay Now"
+// from their dashboard. That's the right behavior — the intent is
+// single-use, and we want the most recent payer to win cleanly.
+paymentIntentRouter.post('/:id/checkout_link/public', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { customerId } = z.object({
+      customerId: z.string().uuid(),
+    }).parse(req.body);
+
+    const intent = await prisma.paymentIntent.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, customerId: true, status: true },
+    });
+    if (!intent) throw new NotFoundError('Payment intent');
+    if (intent.customerId !== customerId) {
+      throw new ValidationError('This invoice does not belong to you');
+    }
+    if (['SUCCEEDED', 'CANCELLED', 'FAILED'].includes(intent.status)) {
+      throw new ValidationError(`Cannot pay an intent in status: ${intent.status}`);
+    }
+
+    const newSecret = crypto.randomBytes(32).toString('base64url');
+    const newHash = crypto.createHash('sha256').update(newSecret).digest('hex');
+
+    await prisma.paymentIntent.update({
+      where: { id: intent.id },
+      data: { clientSecret: newHash },
+    });
+
+    res.json({
+      intentId: intent.id,
+      clientSecret: newSecret,
     });
   } catch (err) {
     next(err);
@@ -138,7 +192,15 @@ paymentIntentRouter.post('/:id/confirm/public', async (req: Request, res: Respon
             expMonth: paymentDetails.card?.expiry_month || null,
             expYear: paymentDetails.card?.expiry_year || null,
             isInternational: paymentDetails.international || false,
-            fingerprint: paymentDetails.card?.emi || null,
+            // Razorpay's Cards API exposes a stable `card.token_iin` / `card.id`
+            // identifier per saved card. We prefer `card.id` (the network token id)
+            // and fall back to the issuer + last4 hash so we still detect duplicates.
+            fingerprint:
+              paymentDetails.card?.id
+              ?? paymentDetails.card?.token
+              ?? (paymentDetails.card?.last4
+                ? `fp_${paymentDetails.card.network ?? 'unk'}_${paymentDetails.card.last4}`
+                : null),
           },
         });
         paymentMethodId = newPm.id;
@@ -187,7 +249,23 @@ paymentIntentRouter.post('/:id/confirm/public', async (req: Request, res: Respon
         feeAmount,
         intent.currency
       );
+
+      await publishEvent(tx, {
+        merchantId: intent.merchantId,
+        type: 'payment_intent.succeeded',
+        payload: {
+          id: intent.id,
+          amount: intent.amount,
+          currency: intent.currency,
+          status: 'SUCCEEDED',
+          customerId: intent.customerId,
+          gateway: 'RAZORPAY',
+          gatewayTxnId: razorpay_payment_id,
+        },
+      });
     });
+
+    enqueueDueDeliveries(prisma).catch(() => {});
 
     const updatedIntent = await prisma.paymentIntent.findUnique({
       where: { id: intent.id },
@@ -209,10 +287,14 @@ paymentIntentRouter.post('/:id/confirm/public', async (req: Request, res: Respon
 // POST /v1/payment_intents/:id/confirm/dummy — simulated invoice capture offline
 paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { client_secret, outcome, payment_method } = z.object({
+    const { client_secret, outcome, payment_method, payment_method_id } = z.object({
       client_secret: z.string(),
       outcome: z.enum(['SUCCESS', 'FAILURE_DECLINED', 'FAILURE_REVERTED']).default('SUCCESS'),
       payment_method: z.string().default('card'),
+      // Optional: re-use a saved PaymentMethod that already belongs to this
+      // intent's customer. Lets the hosted checkout offer a "Pay with saved
+      // card" UX instead of always creating a new tokenised method.
+      payment_method_id: z.string().uuid().optional(),
     }).parse(req.body);
 
     const intent = await prisma.paymentIntent.findUnique({
@@ -239,7 +321,8 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
     };
     const pmType = typeMap[typeUpper] || 'CARD';
 
-    // Mock payment details based on method
+    // Mock payment details based on method (used when creating a fresh PM
+    // record; ignored when `payment_method_id` resolves to a saved one).
     let brand = 'VISA';
     let last4 = '9999';
     if (pmType === 'UPI') {
@@ -256,7 +339,23 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
     const dummyPaymentId = `dmy_pm_${crypto.randomBytes(8).toString('hex')}`;
 
     let paymentMethodId = intent.paymentMethodId;
-    if (intent.customerId && !paymentMethodId) {
+
+    // Branch 1: Caller picked a saved method — verify it belongs to this
+    // intent's customer before binding it. Refuse otherwise.
+    if (payment_method_id && intent.customerId) {
+      const saved = await prisma.paymentMethod.findFirst({
+        where: { id: payment_method_id, customerId: intent.customerId },
+      });
+      if (!saved) {
+        throw new ValidationError('payment_method_id does not belong to this customer');
+      }
+      paymentMethodId = saved.id;
+      // Update mocked card display to match the saved method so the
+      // processorResponse below stays accurate.
+      brand = saved.brand ?? brand;
+      last4 = saved.last4 ?? last4;
+    } else if (intent.customerId && !paymentMethodId) {
+      // Branch 2: No saved method picked → fabricate a new tokenised one.
       const newPm = await prisma.paymentMethod.create({
         data: {
           customerId: intent.customerId,
@@ -317,6 +416,19 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
           feeAmount,
           intent.currency
         );
+
+        await publishEvent(tx, {
+          merchantId: intent.merchantId,
+          type: 'payment_intent.succeeded',
+          payload: {
+            id: intent.id,
+            amount: intent.amount,
+            currency: intent.currency,
+            status: 'SUCCEEDED',
+            customerId: intent.customerId,
+            gateway: 'DUMMY',
+          },
+        });
       } else if (outcome === 'FAILURE_DECLINED') {
         // 2. Failure Declined Flow (No money cut)
         await tx.paymentIntent.update({
@@ -337,6 +449,20 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
             gateway: 'DUMMY',
             gatewayTxnId: dummyPaymentId,
             processorResponse: { method: payment_method, brand, last4, outcome, declineReason: 'Card Declined' },
+          },
+        });
+
+        await publishEvent(tx, {
+          merchantId: intent.merchantId,
+          type: 'payment_intent.failed',
+          payload: {
+            id: intent.id,
+            amount: intent.amount,
+            currency: intent.currency,
+            status: 'FAILED',
+            customerId: intent.customerId,
+            failureCode: 'card_declined',
+            failureMessage: 'Card Declined',
           },
         });
       } else if (outcome === 'FAILURE_REVERTED') {
@@ -413,8 +539,24 @@ paymentIntentRouter.post('/:id/confirm/dummy', async (req: Request, res: Respons
             currency: intent.currency,
           },
         ]);
+
+        await publishEvent(tx, {
+          merchantId: intent.merchantId,
+          type: 'payment_intent.failed',
+          payload: {
+            id: intent.id,
+            amount: intent.amount,
+            currency: intent.currency,
+            status: 'FAILED',
+            customerId: intent.customerId,
+            failureCode: 'reverted',
+            failureMessage: 'Funds captured then automatically reverted',
+          },
+        });
       }
     });
+
+    enqueueDueDeliveries(prisma).catch(() => {});
 
     const updatedIntent = await prisma.paymentIntent.findUnique({
       where: { id: intent.id },
@@ -520,18 +662,38 @@ paymentIntentRouter.post('/', requireScope('payments:write'), async (
       razorpay_order_id: razorpayOrderId,
     };
 
-    const intent = await prisma.paymentIntent.create({
-      data: {
+    const intent = await prisma.$transaction(async (tx) => {
+      const created = await tx.paymentIntent.create({
+        data: {
+          merchantId: req.merchantId!,
+          customerId: data.customerId,
+          amount: data.amount,
+          currency: data.currency.toUpperCase(),
+          status: 'REQUIRES_PM',
+          clientSecret: clientSecretHash,
+          idempotencyKey,
+          captureMethod: data.captureMethod,
+          metadata,
+        },
+      });
+
+      await publishEvent(tx, {
         merchantId: req.merchantId!,
-        customerId: data.customerId,
-        amount: data.amount,
-        currency: data.currency.toUpperCase(),
-        status: 'REQUIRES_PM',
-        clientSecret: clientSecretHash,
-        idempotencyKey,
-        captureMethod: data.captureMethod,
-        metadata,
-      },
+        type: 'payment_intent.created',
+        payload: {
+          id: created.id,
+          amount: created.amount,
+          currency: created.currency,
+          status: created.status,
+          customerId: created.customerId,
+        },
+      });
+
+      return created;
+    });
+
+    enqueueDueDeliveries(prisma).catch(() => {
+      /* fire-and-forget; recovery sweep will catch up */
     });
 
     res.status(201).json({ paymentIntent: { ...intent, clientSecret } });
@@ -623,7 +785,15 @@ paymentIntentRouter.post('/:id/confirm', requireScope('payments:write'), async (
               expMonth: paymentDetails.card?.expiry_month || null,
               expYear: paymentDetails.card?.expiry_year || null,
               isInternational: paymentDetails.international || false,
-              fingerprint: paymentDetails.card?.emi || null,
+              // Razorpay's Cards API exposes a stable `card.token_iin` / `card.id`
+            // identifier per saved card. We prefer `card.id` (the network token id)
+            // and fall back to the issuer + last4 hash so we still detect duplicates.
+            fingerprint:
+              paymentDetails.card?.id
+              ?? paymentDetails.card?.token
+              ?? (paymentDetails.card?.last4
+                ? `fp_${paymentDetails.card.network ?? 'unk'}_${paymentDetails.card.last4}`
+                : null),
             },
           });
           paymentMethodId = newPm.id;
@@ -1026,8 +1196,23 @@ paymentIntentRouter.post('/:id/refund', requireScope('refunds:write'), async (
       // Update Ledger
       await postRefund(tx, intent.merchantId, newRefund.id, refundAmount, intent.currency);
 
+      await publishEvent(tx, {
+        merchantId: intent.merchantId,
+        type: 'refund.created',
+        payload: {
+          id: newRefund.id,
+          amount: refundAmount,
+          currency: intent.currency,
+          paymentIntentId: intent.id,
+          status: 'SUCCEEDED',
+          reason: newRefund.reason,
+        },
+      });
+
       return newRefund;
     });
+
+    enqueueDueDeliveries(prisma).catch(() => {});
 
     res.json({ refund });
   } catch (err) {

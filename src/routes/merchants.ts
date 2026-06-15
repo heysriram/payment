@@ -5,7 +5,8 @@ import { hashSecret } from '../utils/crypto';
 import { ConflictError, ValidationError, NotFoundError } from '../utils/errors';
 import { requireJwt, requireTotpVerified } from '../middleware/jwtAuth';
 import { generateApiKey } from '../services/apiKey';
-import { getAvailableBalance, postSettlement, postRefund, postDisputeOpened, postDisputeWon } from '../services/ledger';
+import { calculateFee } from '../services/fees';
+import { getAvailableBalance, postSettlement, postRefund, postDisputeOpened, postDisputeWon, postCapture } from '../services/ledger';
 import crypto from 'crypto';
 import { redis } from '../redis';
 
@@ -223,10 +224,17 @@ merchantRouter.post(
         metadata: z.record(z.any()).optional(),
       }).parse(req.body);
 
-      // Validate customer belongs to merchant
+      // Validate the referenced customer simply exists. We deliberately do
+      // NOT require ownership: the dashboard's customer dropdown shows every
+      // customer in the database (own + guests + customers from other
+      // merchants), so a merchant may invoice anyone. If the customer isn't
+      // already related to this merchant, paying the resulting intent will
+      // automatically surface them as a "guest" via the existing
+      // `/merchants/customers` query (owned OR has-paid-us).
       if (customerId) {
-        const customer = await prisma.customer.findFirst({
-          where: { id: customerId, merchantId: req.merchantId! },
+        const customer = await prisma.customer.findUnique({
+          where: { id: customerId },
+          select: { id: true },
         });
         if (!customer) throw new NotFoundError('Customer');
       }
@@ -268,9 +276,13 @@ merchantRouter.get(
         include: {
           paymentIntent: {
             select: {
+              id: true,
               currency: true,
               amount: true,
               metadata: true,
+              customer: {
+                select: { id: true, name: true, email: true },
+              },
             },
           },
         },
@@ -298,9 +310,11 @@ merchantRouter.get(
         processorResponse: null,
         occurredAt: e.postedAt,
         paymentIntent: {
+          id: '',
           currency: e.currency,
           amount: Math.abs(e.delta),
           metadata: { type: e.refType.toLowerCase() },
+          customer: null,
         },
       }));
 
@@ -388,6 +402,127 @@ merchantRouter.post(
       });
 
       res.json({ refund });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// POST /v1/merchants/payment-intents/:id/capture — manual capture of an
+// authorised intent (only valid for captureMethod=MANUAL intents that are in
+// PROCESSING). Mirrors POST /v1/payment_intents/:id/capture but uses the
+// dashboard JWT instead of an API key.
+merchantRouter.post(
+  '/payment-intents/:id/capture',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const intent = await prisma.paymentIntent.findFirst({
+        where: { id: req.params.id, merchantId: req.merchantId! },
+        include: {
+          merchant: { include: { feePlan: true } },
+          paymentMethod: { select: { isInternational: true } },
+        },
+      });
+
+      if (!intent) throw new NotFoundError('Payment intent');
+      if (intent.captureMethod !== 'MANUAL') {
+        throw new ValidationError('This intent uses automatic capture');
+      }
+      if (intent.status !== 'PROCESSING') {
+        throw new ValidationError(`Cannot capture intent in status: ${intent.status}`);
+      }
+
+      const authTxn = await prisma.transaction.findFirst({
+        where: { paymentIntentId: intent.id, type: 'AUTH', status: 'SUCCEEDED' },
+      });
+      if (!authTxn) throw new NotFoundError('Auth transaction');
+      if (!intent.paymentMethod) throw new NotFoundError('Payment method');
+
+      const feeAmount = calculateFee(
+        intent.amount,
+        intent.merchant.feePlan,
+        intent.paymentMethod.isInternational
+      );
+
+      await prisma.$transaction(async (tx) => {
+        const reserved = await tx.paymentIntent.updateMany({
+          where: { id: intent.id, merchantId: req.merchantId!, status: 'PROCESSING' },
+          data: { status: 'SUCCEEDED' },
+        });
+        if (reserved.count !== 1) {
+          throw new ValidationError('Payment intent is already captured');
+        }
+
+        const captureTxn = await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'CAPTURE',
+            amount: intent.amount,
+            status: 'SUCCEEDED',
+            gateway: 'RAZORPAY',
+          },
+        });
+
+        await postCapture(tx, intent.merchantId, captureTxn.id, intent.amount, feeAmount, intent.currency);
+      });
+
+      res.json({
+        paymentIntent: { id: intent.id, status: 'SUCCEEDED', amount: intent.amount, currency: intent.currency },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// POST /v1/merchants/payment-intents/:id/cancel — cancel an unfinished intent
+// (anything not yet SUCCEEDED/CANCELLED/FAILED/PROCESSING). Dashboard JWT.
+merchantRouter.post(
+  '/payment-intents/:id/cancel',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const intent = await prisma.paymentIntent.findFirst({
+        where: { id: req.params.id, merchantId: req.merchantId! },
+      });
+
+      if (!intent) throw new NotFoundError('Payment intent');
+      if (['SUCCEEDED', 'CANCELLED', 'FAILED'].includes(intent.status)) {
+        throw new ValidationError(`Cannot cancel intent in status: ${intent.status}`);
+      }
+
+      await prisma.$transaction(async (tx) => {
+        const reserved = await tx.paymentIntent.updateMany({
+          where: {
+            id: intent.id,
+            merchantId: req.merchantId!,
+            status: { notIn: ['SUCCEEDED', 'CANCELLED', 'FAILED', 'PROCESSING'] },
+          },
+          data: { status: 'CANCELLED' },
+        });
+        if (reserved.count !== 1) {
+          throw new ValidationError('Payment intent cannot be cancelled');
+        }
+
+        await tx.transaction.create({
+          data: {
+            paymentIntentId: intent.id,
+            merchantId: intent.merchantId,
+            type: 'VOID',
+            amount: intent.amount,
+            status: 'SUCCEEDED',
+            gateway: 'RAZORPAY',
+          },
+        });
+      });
+
+      res.json({
+        paymentIntent: { id: intent.id, status: 'CANCELLED', amount: intent.amount, currency: intent.currency },
+      });
     } catch (err) {
       next(err);
     }
@@ -669,15 +804,119 @@ merchantRouter.get(
   }
 );
 
+// GET /v1/merchants/customers — full customer roster with purchase aggregates
+//
+// Returns every customer the merchant has interacted with, joined with
+//   - lifetime spend / payment counts (across THIS merchant's intents only)
+//   - count of saved payment methods
+//   - wallet balance from Redis (defaults to 0 if Redis is empty)
+//   - createdAt / lastPaymentAt for "newest customer" / "active recently" sorts
+//
+// "Interacted with" means either:
+//   1. Customer's home merchant is this one (customer.merchantId === me)
+//   2. Customer has ever paid this merchant via a PaymentIntent
+//
+// The second branch matters because the public-portal customer registration
+// (POST /customers/register/public) attaches the new Customer record to
+// `prisma.merchant.findFirst()` — i.e. an arbitrary merchant — but the
+// resulting payments still target the correct merchant. So a customer who
+// registered on the platform and paid you should still appear in your roster.
+//
+// Powers the merchant dashboard's "All Customers" panel.
+merchantRouter.get(
+  '/customers',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const merchantId = req.merchantId!;
+
+      const customers = await prisma.customer.findMany({
+        where: {
+          OR: [
+            { merchantId },
+            { paymentIntents: { some: { merchantId } } },
+          ],
+        },
+        orderBy: { createdAt: 'desc' },
+        include: {
+          _count: { select: { paymentMethods: true } },
+          // Only this merchant's intents count toward aggregates — a customer
+          // who paid a different merchant shouldn't inflate this merchant's
+          // "totalSpent" / "totalPayments" numbers.
+          paymentIntents: {
+            where: { merchantId },
+            select: {
+              id: true,
+              amount: true,
+              currency: true,
+              status: true,
+              createdAt: true,
+            },
+          },
+        },
+      });
+
+      const result = await Promise.all(
+        customers.map(async (c) => {
+          const successfulIntents = c.paymentIntents.filter((i) => i.status === 'SUCCEEDED');
+          const totalSpent = successfulIntents.reduce((sum, i) => sum + i.amount, 0);
+          const lastPaymentAt =
+            c.paymentIntents.length > 0
+              ? c.paymentIntents
+                  .map((i) => i.createdAt.getTime())
+                  .reduce((a, b) => Math.max(a, b))
+              : null;
+
+          const balanceStr = await redis.get(`wallet:balance:${c.id}`);
+          const walletBalance = balanceStr ? parseInt(balanceStr, 10) : 0;
+
+          return {
+            id: c.id,
+            name: c.name,
+            email: c.email,
+            phone: c.phone ?? null,
+            createdAt: c.createdAt,
+            walletBalance,
+            totalSpent,
+            totalPayments: c.paymentIntents.length,
+            successfulPayments: successfulIntents.length,
+            paymentMethodCount: c._count.paymentMethods,
+            lastPaymentAt: lastPaymentAt ? new Date(lastPaymentAt) : null,
+            currency: c.paymentIntents[0]?.currency ?? 'INR',
+            // Flag whether this customer is the merchant's own (vs. a
+            // platform-registered shopper who only paid us). Useful for UI
+            // tagging.
+            isOwnCustomer: c.merchantId === merchantId,
+          };
+        })
+      );
+
+      res.json({ customers: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // GET /v1/merchants/wallets — get all customers with their wallet balances
+//
+// Mirrors the inclusion logic of GET /merchants/customers: any customer who
+// has interacted with this merchant (owned OR paid us) is returned.
 merchantRouter.get(
   '/wallets',
   requireJwt,
   requireTotpVerified,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const merchantId = req.merchantId!;
       const customers = await prisma.customer.findMany({
-        where: { merchantId: req.merchantId! },
+        where: {
+          OR: [
+            { merchantId },
+            { paymentIntents: { some: { merchantId } } },
+          ],
+        },
         select: { id: true, name: true, email: true },
         orderBy: { name: 'asc' },
       });
@@ -711,9 +950,17 @@ merchantRouter.get(
     try {
       const customerId = req.params.customerId;
 
-      // Verify customer belongs to this merchant
+      // Verify the merchant has any relationship with this customer (owned
+      // OR has accepted at least one payment from them). Same trust model as
+      // GET /merchants/customers — guests-with-history must show up too.
       const customer = await prisma.customer.findFirst({
-        where: { id: customerId, merchantId: req.merchantId! },
+        where: {
+          id: customerId,
+          OR: [
+            { merchantId: req.merchantId! },
+            { paymentIntents: { some: { merchantId: req.merchantId! } } },
+          ],
+        },
       });
       if (!customer) throw new NotFoundError('Customer');
 
@@ -721,6 +968,295 @@ merchantRouter.get(
       const transactions = txnsRaw.map((t) => JSON.parse(t));
 
       res.json({ transactions });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// POST /v1/merchants/customers — create a new customer from the merchant
+// dashboard. JWT-scoped wrapper around the API-key /customers endpoint so
+// merchants don't have to mint a key with customers:write just to use the UI.
+//
+// `externalId` is auto-generated when not provided so the dashboard form can
+// stay a simple "name / email / phone" 3-field UX. Power users (CSV imports,
+// CRMs) can still pass their own.
+merchantRouter.post(
+  '/customers',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const data = z
+        .object({
+          externalId: z.string().min(1).max(200).optional(),
+          email: z.string().email().optional(),
+          phone: z
+            .string()
+            .regex(/^\+?[1-9]\d{1,14}$/)
+            .optional(),
+          name: z.string().max(200).optional(),
+        })
+        .parse(req.body);
+
+      const externalId = data.externalId ?? `cust_${crypto.randomBytes(8).toString('hex')}`;
+
+      const existing = await prisma.customer.findUnique({
+        where: {
+          merchantId_externalId: { merchantId: req.merchantId!, externalId },
+        },
+      });
+      if (existing) {
+        throw new ConflictError(`Customer with externalId '${externalId}' already exists`);
+      }
+
+      const customer = await prisma.customer.create({
+        data: {
+          merchantId: req.merchantId!,
+          externalId,
+          email: data.email,
+          phone: data.phone,
+          name: data.name,
+        },
+      });
+
+      res.status(201).json({ customer });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// GET /v1/merchants/customers/:id — full customer drill-down (profile +
+// payment methods + recent intents). Same trust model as the listing route:
+// a merchant can read any customer they own OR who has paid them.
+merchantRouter.get(
+  '/customers/:id',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const merchantId = req.merchantId!;
+      const customer = await prisma.customer.findFirst({
+        where: {
+          id: req.params.id,
+          OR: [
+            { merchantId },
+            { paymentIntents: { some: { merchantId } } },
+          ],
+        },
+        include: {
+          paymentMethods: {
+            select: {
+              id: true,
+              type: true,
+              brand: true,
+              last4: true,
+              expMonth: true,
+              expYear: true,
+              createdAt: true,
+            },
+            orderBy: { createdAt: 'desc' },
+          },
+          paymentIntents: {
+            where: { merchantId },
+            select: {
+              id: true,
+              amount: true,
+              currency: true,
+              status: true,
+              captureMethod: true,
+              createdAt: true,
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 25,
+          },
+        },
+      });
+      if (!customer) throw new NotFoundError('Customer');
+
+      const balanceStr = await redis.get(`wallet:balance:${customer.id}`);
+      const walletBalance = balanceStr ? parseInt(balanceStr, 10) : 0;
+
+      const isOwnCustomer = customer.merchantId === merchantId;
+
+      res.json({
+        customer: {
+          id: customer.id,
+          externalId: customer.externalId,
+          name: customer.name,
+          email: customer.email,
+          phone: customer.phone,
+          createdAt: customer.createdAt,
+          isOwnCustomer,
+          walletBalance,
+          paymentMethods: customer.paymentMethods,
+          paymentIntents: customer.paymentIntents,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// GET /v1/merchants/customers-search?q=&include_own=&limit= — search the
+// GLOBAL customer table (all merchants).
+//
+// Two modes:
+//   - default (`include_own=false`): excludes customers owned by this
+//     merchant. Used by the "Import existing customer" modal.
+//   - `include_own=true`: returns ALL customers (this merchant's own,
+//     guests who paid them, and customers from other merchants). Used by
+//     the "Create Payment Link" customer dropdown so any customer in the
+//     database is selectable.
+//
+// `limit` defaults to 25, capped at 500. Larger values are useful when the
+// frontend wants to render the entire roster in a <select>; smaller values
+// keep the import search lightweight.
+//
+// Each row carries an `isOwnCustomer` boolean so the UI can group results.
+// `alreadyImported` flags candidates whose email is already in this
+// merchant's roster (to warn before a duplicate import).
+merchantRouter.get(
+  '/customers-search',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { q, include_own, limit } = z
+        .object({
+          q: z.string().min(1).max(200).optional(),
+          include_own: z
+            .union([z.literal('true'), z.literal('false')])
+            .optional()
+            .transform((v) => v === 'true'),
+          limit: z.coerce.number().int().min(1).max(500).default(25),
+        })
+        .parse(req.query);
+
+      const merchantId = req.merchantId!;
+
+      const where: any = {};
+      if (!include_own) {
+        // Exclude customers already owned by this merchant — caller is the
+        // import flow, which doesn't want to copy a customer we already own.
+        where.merchantId = { not: merchantId };
+      }
+
+      if (q) {
+        where.OR = [
+          { name: { contains: q, mode: 'insensitive' } },
+          { email: { contains: q, mode: 'insensitive' } },
+          { phone: { contains: q } },
+          { externalId: { contains: q, mode: 'insensitive' } },
+        ];
+      }
+
+      const candidates = await prisma.customer.findMany({
+        where,
+        select: {
+          id: true,
+          merchantId: true,
+          name: true,
+          email: true,
+          phone: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+      });
+
+      // Flag GUEST candidates whose email already exists under this merchant
+      // so the UI can warn before importing a duplicate-by-email record.
+      // Own customers are skipped — they're already "in your roster" by
+      // virtue of merchantId === me, no import needed.
+      const guestEmails = candidates
+        .filter((c) => c.merchantId !== merchantId && c.email)
+        .map((c) => c.email!) as string[];
+      const existingMine = guestEmails.length
+        ? await prisma.customer.findMany({
+            where: { merchantId, email: { in: guestEmails } },
+            select: { email: true },
+          })
+        : [];
+      const existingEmails = new Set(existingMine.map((c) => c.email));
+
+      const data = candidates.map((c) => {
+        const isOwn = c.merchantId === merchantId;
+        return {
+          id: c.id,
+          name: c.name,
+          email: c.email,
+          phone: c.phone,
+          createdAt: c.createdAt,
+          isOwnCustomer: isOwn,
+          alreadyImported: isOwn ? false : c.email ? existingEmails.has(c.email) : false,
+        };
+      });
+
+      res.json({ data });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// POST /v1/merchants/customers/import — copy a customer from the global pool
+// into this merchant's roster. Non-destructive: the source customer record
+// is left untouched, and a new owned customer is created with copied profile
+// fields and a fresh externalId. Future invoices the merchant creates can
+// reference the new owned customer; historical "guest" payments still link
+// back to the source record.
+merchantRouter.post(
+  '/customers/import',
+  requireJwt,
+  requireTotpVerified,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { sourceCustomerId } = z
+        .object({ sourceCustomerId: z.string().uuid() })
+        .parse(req.body);
+
+      const merchantId = req.merchantId!;
+
+      const source = await prisma.customer.findUnique({
+        where: { id: sourceCustomerId },
+        select: { id: true, merchantId: true, name: true, email: true, phone: true },
+      });
+      if (!source) throw new NotFoundError('Customer');
+      if (source.merchantId === merchantId) {
+        throw new ValidationError('Customer is already owned by this merchant');
+      }
+
+      // Reject if the merchant already has a customer with this email — it
+      // would create a confusing duplicate. Caller should use the existing
+      // record instead.
+      if (source.email) {
+        const dupe = await prisma.customer.findFirst({
+          where: { merchantId, email: source.email },
+          select: { id: true, name: true },
+        });
+        if (dupe) {
+          throw new ConflictError(
+            `You already have a customer with email '${source.email}' (${dupe.name ?? dupe.id})`
+          );
+        }
+      }
+
+      const externalId = `cust_imported_${crypto.randomBytes(6).toString('hex')}`;
+
+      const created = await prisma.customer.create({
+        data: {
+          merchantId,
+          externalId,
+          name: source.name,
+          email: source.email,
+          phone: source.phone,
+        },
+      });
+
+      res.status(201).json({ customer: created, sourceCustomerId: source.id });
     } catch (err) {
       next(err);
     }

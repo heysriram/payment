@@ -1,0 +1,12 @@
+# DO NOT EDIT — this file is generated.
+# Source of truth: /openapi.yaml
+# Regenerate with: npm run docs:bundle
+#
+# This placeholder will be replaced on the first run of `npm run docs:bundle`.
+# CI job `docs-drift` enforces that this file matches `redocly bundle`
+# output exactly — your PR will fail until you commit a real bundle.
+openapi: 3.0.3
+info:
+  title: '__placeholder — run `npm run docs:bundle`'
+  version: '0.0.0-placeholder'
+paths: {}

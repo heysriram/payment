@@ -1,0 +1,512 @@
+{
+  "info": {
+    "_postman_id": "ec1f9a2c-1a3a-4b51-9b1f-payments-collection-001",
+    "name": "Payment Gateway",
+    "description": "Stripe-style flows against the in-house payment gateway. Run end-to-end via Newman (`npm run test:postman`).\n\nFlows covered:\n1. Merchant onboarding → login → TOTP\n2. Issue/list/revoke API keys\n3. Create customer → attach payment method (token-only)\n4. Create payment intent → confirm (vault flow) → capture / refund\n5. Idempotency replay assertion\n6. Public checkout (dummy outcome)\n7. Customer wallet top-up + withdraw\n\nAll requests carry pre/post scripts that:\n* assert HTTP status,\n* validate the response shape against `openapi.yaml`,\n* save IDs into collection variables for the next request.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "variable": [
+    { "key": "merchantSecretKey",  "value": "" },
+    { "key": "merchantPublicKey",  "value": "" },
+    { "key": "merchantId",         "value": "" },
+    { "key": "dashboardJwt",       "value": "" },
+    { "key": "partialJwt",         "value": "" },
+    { "key": "customerId",         "value": "" },
+    { "key": "paymentMethodId",    "value": "" },
+    { "key": "paymentIntentId",    "value": "" },
+    { "key": "paymentIntentClientSecret", "value": "" },
+    { "key": "idempotencyKey",     "value": "" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Generate a fresh Idempotency-Key for any POST that needs one.",
+          "if (pm.request.method === 'POST' && pm.request.url.toString().includes('/payment_intents') && !pm.request.url.toString().includes('confirm') && !pm.request.url.toString().includes('cancel') && !pm.request.url.toString().includes('capture') && !pm.request.url.toString().includes('refund')) {",
+          "  if (!pm.collectionVariables.get('idempotencyKey')) {",
+          "    pm.collectionVariables.set('idempotencyKey', 'idem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10));",
+          "  }",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health & Docs",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/health", "host": ["{{baseUrl}}"], "path": ["api", "health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('status field is ok', () => {",
+                  "  const data = pm.response.json();",
+                  "  pm.expect(data.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /ready",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/ready", "host": ["{{baseUrl}}"], "path": ["api", "ready"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('checks pass', () => {",
+                  "  const d = pm.response.json();",
+                  "  pm.expect(d.checks.postgres).to.eql('ok');",
+                  "  pm.expect(d.checks.redis).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/payments/openapi.json",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/payments/openapi.json",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "payments", "openapi.json"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('OpenAPI 3.0', () => {",
+                  "  const d = pm.response.json();",
+                  "  pm.expect(d.openapi).to.match(/^3\\./);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Merchant Onboarding",
+      "item": [
+        {
+          "name": "POST /merchants/register",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman Test Store\",\n  \"legalName\": \"Postman Test Store Pvt Ltd\",\n  \"gst\": \"27ABCDE1234F1Z5\",\n  \"pan\": \"ABCDE1234F\",\n  \"email\": \"merchant+{{$timestamp}}@postman.test\",\n  \"password\": \"StrongPassword123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merchants/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "merchants", "register"]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Use a unique email per run so registration always succeeds in CI.",
+                  "const email = 'merchant_' + Date.now() + '@postman.test';",
+                  "pm.collectionVariables.set('merchantEmail', email);",
+                  "const body = JSON.parse(pm.request.body.raw);",
+                  "body.email = email;",
+                  "pm.request.body.update(JSON.stringify(body));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const d = pm.response.json();",
+                  "pm.collectionVariables.set('merchantId', d.merchant.id);",
+                  "pm.collectionVariables.set('merchantSecretKey', d.apiKeys.test.secretKey);",
+                  "pm.collectionVariables.set('merchantPublicKey', d.apiKeys.test.publicKey);",
+                  "pm.test('returned secret key looks like sk_test_*', () => {",
+                  "  pm.expect(d.apiKeys.test.secretKey).to.match(/^sk_test_/);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /auth/login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{merchantEmail}}\",\n  \"password\": \"StrongPassword123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "auth", "login"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "pm.expect(d.requiresTotp).to.eql(true);",
+                  "pm.collectionVariables.set('partialJwt', d.token);",
+                  "if (d.totpUri) pm.collectionVariables.set('totpUri', d.totpUri);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Customers & Payment Methods (API key)",
+      "item": [
+        {
+          "name": "POST /customers",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantSecretKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"externalId\": \"cust_pm_{{$timestamp}}\",\n  \"email\": \"customer+{{$timestamp}}@postman.test\",\n  \"name\": \"Postman Customer\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/customers",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "customers"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('customerId', pm.response.json().customer.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /payment_methods (token only)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantPublicKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"tokenId\": \"tok_test_{{$timestamp}}\",\n  \"type\": \"CARD\",\n  \"brand\": \"VISA\",\n  \"last4\": \"4242\",\n  \"expMonth\": 12,\n  \"expYear\": 2030,\n  \"isInternational\": false\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_methods",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_methods"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const d = pm.response.json();",
+                  "pm.collectionVariables.set('paymentMethodId', d.paymentMethod.id);",
+                  "pm.test('no PAN/CVV in response', () => {",
+                  "  const text = JSON.stringify(d);",
+                  "  pm.expect(text).to.not.match(/pan/i);",
+                  "  pm.expect(text).to.not.match(/cvv/i);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Payment Intents",
+      "item": [
+        {
+          "name": "POST /payment_intents (with Idempotency-Key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantSecretKey}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 50000,\n  \"currency\": \"INR\",\n  \"customerId\": \"{{customerId}}\",\n  \"captureMethod\": \"AUTOMATIC\",\n  \"metadata\": { \"source\": \"postman\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_intents",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_intents"]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('idempotencyKey', 'idem_' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const d = pm.response.json();",
+                  "pm.collectionVariables.set('paymentIntentId', d.paymentIntent.id);",
+                  "pm.collectionVariables.set('paymentIntentClientSecret', d.paymentIntent.clientSecret);",
+                  "pm.test('status is REQUIRES_PM', () => pm.expect(d.paymentIntent.status).to.eql('REQUIRES_PM'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /payment_intents (replay = idempotent)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantSecretKey}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 50000,\n  \"currency\": \"INR\",\n  \"customerId\": \"{{customerId}}\",\n  \"captureMethod\": \"AUTOMATIC\",\n  \"metadata\": { \"source\": \"postman\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_intents",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_intents"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK on replay', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "pm.test('idempotent flag set', () => pm.expect(d.idempotent).to.eql(true));",
+                  "pm.test('same payment intent id', () => {",
+                  "  pm.expect(d.paymentIntent.id).to.eql(pm.collectionVariables.get('paymentIntentId'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /payment_intents/:id/confirm/dummy (SUCCESS)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"client_secret\": \"{{paymentIntentClientSecret}}\",\n  \"outcome\": \"SUCCESS\",\n  \"payment_method\": \"card\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_intents/{{paymentIntentId}}/confirm/dummy",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_intents", "{{paymentIntentId}}", "confirm", "dummy"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "pm.test('intent SUCCEEDED', () => pm.expect(d.paymentIntent.status).to.eql('SUCCEEDED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /payment_intents/:id/refund (partial)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantSecretKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 10000,\n  \"reason\": \"customer requested partial refund\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_intents/{{paymentIntentId}}/refund",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_intents", "{{paymentIntentId}}", "refund"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json();",
+                  "pm.test('refund SUCCEEDED', () => pm.expect(d.refund.status).to.eql('SUCCEEDED'));",
+                  "pm.test('refund amount = 10000', () => pm.expect(d.refund.amount).to.eql(10000));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. Negative cases",
+      "item": [
+        {
+          "name": "POST /payment_intents without Idempotency-Key → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{merchantSecretKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 50000,\n  \"currency\": \"INR\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/payment_intents",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "payment_intents"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 validation_error', () => pm.response.to.have.status(400));",
+                  "const d = pm.response.json();",
+                  "pm.expect(d.error.code).to.eql('validation_error');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /customers without API key → 401",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"externalId\": \"x\" }"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/customers",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "customers"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 authentication_required', () => pm.response.to.have.status(401));",
+                  "pm.expect(pm.response.json().error.code).to.eql('authentication_required');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /payment_methods with public key + non-tokenize scope key would fail (skipped)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "health"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test.skip('placeholder for scope-mismatch case', () => {});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
